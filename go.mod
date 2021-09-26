@@ -3,6 +3,7 @@ module github.com/ElonN/arson
 go 1.17
 
 require (
+	github.com/bwmarrin/snowflake v0.3.0
 	github.com/klauspost/reedsolomon v1.9.13
 	github.com/sirupsen/logrus v1.8.1
 )
