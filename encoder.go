@@ -49,24 +49,26 @@ import (
 )
 
 const (
-	numDataShards    = 10
-	numParShards     = 3
-	totalShards      = numDataShards + numParShards
-	shardHeaderSize  = 32
-	fullShardSize    = 1300
-	shardDataSize    = fullShardSize - shardHeaderSize
-	totalChunkBuffer = totalShards * shardDataSize
-	typeData         = 0xf1
-	typeParity       = 0xf2
+	shardHeaderSize = 32
 )
 
-var inputFile = flag.String("f", "", "Input file")
-var outDir = flag.String("out", "", "Alternative output directory")
-var maxChunkSize = shardDataSize * numDataShards
-var all_files map[uint64][]Chunk
-var all_files_sync map[uint64]*file_status
-var new_file_mutex sync.Mutex
-var debug_file_id uint64
+var (
+	arg_num_data_shards   = flag.Int("ds", 10, "Number of data shards")
+	arg_num_parity_shards = flag.Int("ps", 3, "Number of parity shards")
+	total_shards          = *arg_num_data_shards + *arg_num_parity_shards
+	arg_full_shard_size   = flag.Int("mss", 1300, "Maximum segment size to send (shard + header)")
+	shard_data_size       = *arg_full_shard_size - shardHeaderSize
+	total_chunk_buffer    = total_shards * shard_data_size
+	type_data             = 0xf1
+	type_parity           = 0xf2
+	arg_input_file        = flag.String("f", "", "Input file")
+	arg_out_dir           = flag.String("out", "", "Alternative output directory")
+	max_chunk_size        = shard_data_size * *arg_num_data_shards
+	all_files             map[uint64][]Chunk
+	all_files_sync        map[uint64]*FileStatus
+	new_file_mutex        sync.Mutex
+	debug_file_id         uint64
+)
 
 func init() {
 	flag.Usage = func() {
@@ -87,19 +89,18 @@ func init() {
 }
 
 type Chunk struct {
-	bufsize           int
-	chunk_ord         int
+	chunk_data_size   int
+	chunk_idx         int
 	file_id           int
 	file_size         int
 	total_chunks      int
 	num_data_shards   byte
 	num_parity_shards byte
 	shards            [][]byte
-	chunkBuffer       []byte
+	chunk_buffer      []byte
 }
 
-type file_status struct {
-	bufsize           int
+type FileStatus struct {
 	file_id           uint64
 	file_size         uint64
 	total_chunks      int
@@ -108,19 +109,18 @@ type file_status struct {
 	num_data_shards   byte
 	num_parity_shards byte
 	num_total_shards  byte
-	shard_size        int
-	chunks_status     []sync.WaitGroup
+	shard_data_size   int
 }
 
 func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_ord uint32,
-	total_chunks uint32, chunk_data_size uint32, shard_ord uint16, num_data_shards byte,
+	total_chunks uint32, chunk_data_size uint32, shard_idx uint16, num_data_shards byte,
 	num_parity_shards byte) {
 	//
 	//The header format:
 	// |                      file_id(8B)                         |
 	// |                      file_size(8B)                       |
 	// |      chunk_ord (4B)          |       total_chunks(4B)    |
-	// |	  chunk_data_size(4B)	  |shard_ord(2B)|DS(1B)|PS(1B)|
+	// |	  chunk_data_size(4B)	  |shard_idx(2B)|DS(1B)|PS(1B)|
 	//
 	//
 	file_id = binary.LittleEndian.Uint64(b)
@@ -128,7 +128,7 @@ func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_ord u
 	chunk_ord = binary.LittleEndian.Uint32(b[16:])
 	total_chunks = binary.LittleEndian.Uint32(b[20:])
 	chunk_data_size = binary.LittleEndian.Uint32(b[24:])
-	shard_ord = binary.LittleEndian.Uint16(b[28:])
+	shard_idx = binary.LittleEndian.Uint16(b[28:])
 	num_data_shards = byte(b[30])
 	num_parity_shards = byte(b[31])
 	return
@@ -139,18 +139,18 @@ func mark_shard_header(b []byte, c *Chunk, idx int) {
 	//The header format:
 	// |                      file_id(8B)                         |
 	// |                      file_size(8B)                       |
-	// |      chunk_ord (4B)          |       total_chunks(4B)    |
-	// |	  chunk_data_size(4B)	  |shard_ord(2B)|DS(1B)|PS(1B)|
+	// |      chunk_idx (4B)          |       total_chunks(4B)    |
+	// |	  chunk_data_size(4B)	  |shard_idx(2B)|DS(1B)|PS(1B)|
 	//
 	//
 	binary.LittleEndian.PutUint64(b, uint64(c.file_id))
 	binary.LittleEndian.PutUint64(b[8:], uint64(c.file_size))
-	binary.LittleEndian.PutUint32(b[16:], uint32(c.chunk_ord))
+	binary.LittleEndian.PutUint32(b[16:], uint32(c.chunk_idx))
 	binary.LittleEndian.PutUint32(b[20:], uint32(c.total_chunks))
-	binary.LittleEndian.PutUint32(b[24:], uint32(c.bufsize))
+	binary.LittleEndian.PutUint32(b[24:], uint32(c.chunk_data_size))
 	binary.LittleEndian.PutUint16(b[28:], uint16(idx))
-	b[30] = uint8(numDataShards)
-	b[31] = uint8(numParShards)
+	b[30] = uint8(*arg_num_data_shards)
+	b[31] = uint8(*arg_num_parity_shards)
 }
 
 func Min(x, y int64) int64 {
@@ -182,15 +182,15 @@ func get_chunks(filename string, chunk_size int, file_id int) ([]Chunk, error) {
 	chunks := make([]Chunk, num_chunks)
 
 	for i := 0; i < num_chunks; i++ {
-		chunks[i].bufsize = chunk_size
-		chunks[i].chunk_ord = i
+		chunks[i].chunk_data_size = chunk_size
+		chunks[i].chunk_idx = i
 		chunks[i].file_id = file_id
 		chunks[i].total_chunks = num_chunks
 		chunks[i].file_size = int(filesize)
-		chunks[i].chunkBuffer = make([]byte, totalShards*shardDataSize)
+		chunks[i].chunk_buffer = make([]byte, total_shards*shard_data_size)
 	}
 	// last one is the remainder
-	chunks[num_chunks-1].bufsize = int(filesize) - chunks[num_chunks-1].chunk_ord*chunk_size
+	chunks[num_chunks-1].chunk_data_size = int(filesize) - chunks[num_chunks-1].chunk_idx*chunk_size
 
 	// Make channels to pass fatal errors in WaitGroup
 	fatalErrors := make(chan error)
@@ -208,32 +208,31 @@ func get_chunks(filename string, chunk_size int, file_id int) ([]Chunk, error) {
 			this_chunk := &chunksizes[i]
 
 			//				 |------DATA SHARDS-----------| |----PARITY SHARDS-----|
-			// chunkBuffer = data_from_file + zero_padding + space_for_parity_shards
-			//				 |---bufsize---|
+			// chunk_buffer = data_from_file + zero_padding + space_for_parity_shards
+			//				 |chunk_data_size|
 
-			data_from_file := this_chunk.chunkBuffer[:this_chunk.bufsize]
-			bytesRead, err := file.ReadAt(data_from_file, int64(this_chunk.chunk_ord)*int64(chunk_size))
+			data_from_file := this_chunk.chunk_buffer[:this_chunk.chunk_data_size]
+			bytesRead, err := file.ReadAt(data_from_file, int64(this_chunk.chunk_idx)*int64(chunk_size))
 
-			log.Debug("Read ", bytesRead, " / ", this_chunk.bufsize, " bytes for chunk ", i)
+			log.Debug("Read ", bytesRead, " / ", this_chunk.chunk_data_size, " bytes for chunk ", i)
 
-			if bytesRead != this_chunk.bufsize {
+			if bytesRead != this_chunk.chunk_data_size {
 				fatalErrors <- fmt.Errorf("get_chunks: chunk %d at ordinal %d read %d bytes (expected %d)",
-					i, this_chunk.chunk_ord, bytesRead, this_chunk.bufsize)
+					i, this_chunk.chunk_idx, bytesRead, this_chunk.chunk_data_size)
 			}
 			if err != nil {
 				fatalErrors <- err
 			}
 
-			// "shards" are slices from chunkBuffer
-			this_chunk.shards = make([][]byte, totalShards)
-			for j := 0; j < totalShards; j++ {
-				idx_start := shardDataSize * j
-				idx_end := shardDataSize * (j + 1)
-				this_chunk.shards[j] = this_chunk.chunkBuffer[idx_start:idx_end]
+			// "shards" are slices from chunk_buffer
+			this_chunk.shards = make([][]byte, total_shards)
+			for j := 0; j < total_shards; j++ {
+				idx_start := shard_data_size * j
+				this_chunk.shards[j] = this_chunk.chunk_buffer[idx_start : idx_start+shard_data_size]
 			}
 
 			// Create encoding matrix.
-			enc, err := reedsolomon.New(numDataShards, numParShards)
+			enc, err := reedsolomon.New(*arg_num_data_shards, *arg_num_parity_shards)
 			if err != nil {
 				fatalErrors <- err
 			}
@@ -264,7 +263,7 @@ func get_chunks(filename string, chunk_size int, file_id int) ([]Chunk, error) {
 }
 
 func send_chunks(chunks []Chunk) error {
-	out_base := filepath.Join(*outDir, filepath.Base(*inputFile))
+	out_base := filepath.Join(*arg_out_dir, filepath.Base(*arg_input_file))
 	log.Debugf("OUTPUT is in: %s.%04d", out_base, 1)
 
 	// Make channels to pass fatal errors in WaitGroup
@@ -279,7 +278,7 @@ func send_chunks(chunks []Chunk) error {
 		go func(i int, c Chunk) {
 			log.Debug("Inside sending goroutine number ", i)
 
-			for j := 0; j < totalShards; j++ {
+			for j := 0; j < total_shards; j++ {
 				f, err := os.OpenFile(fmt.Sprintf("%s.%04d.%04d", out_base, i, j),
 					os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 				if err != nil {
@@ -328,17 +327,17 @@ func send_chunks(chunks []Chunk) error {
 }
 
 func enc() {
-	if *inputFile == "" {
+	if *arg_input_file == "" {
 		fmt.Fprintf(os.Stderr, "Error: No input filename given\n")
 		flag.Usage()
 		os.Exit(1)
 	}
-	log.Debug("OK, file is ", *inputFile)
+	log.Debug("OK, file is ", *arg_input_file)
 
 	idGen, err := snowflake.NewNode(1)
 	checkErr(err)
 
-	chunks, err := get_chunks(*inputFile, maxChunkSize, int(idGen.Generate()))
+	chunks, err := get_chunks(*arg_input_file, max_chunk_size, int(idGen.Generate()))
 	checkErr(err)
 
 	err = send_chunks(chunks)
@@ -415,10 +414,10 @@ func reconstruct_chunks(file_id uint64) {
 	for _, chunk := range chunks {
 		ok, err := enc.Verify(chunk.shards)
 		if ok {
-			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_ord, file_status.total_chunks-1)
+			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_idx, file_status.total_chunks-1)
 		} else {
 			log.Debugf("Verification failed  chunk no. %d / %d. Reconstructing data",
-				chunk.chunk_ord, file_status.total_chunks-1)
+				chunk.chunk_idx, file_status.total_chunks-1)
 			err = enc.Reconstruct(chunk.shards)
 			if err != nil {
 				checkErr(err)
@@ -426,10 +425,10 @@ func reconstruct_chunks(file_id uint64) {
 			ok, err = enc.Verify(chunk.shards)
 			if !ok {
 				log.Debugf("Reconstruction failed  chunk no. %d / %d. Reconstructing data",
-					chunk.chunk_ord, file_status.total_chunks-1)
+					chunk.chunk_idx, file_status.total_chunks-1)
 				checkErr(err)
 			}
-			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_ord, file_status.total_chunks-1)
+			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_idx, file_status.total_chunks-1)
 
 		}
 		checkErr(err)
@@ -441,15 +440,15 @@ func recover_files() {
 	f, err := os.OpenFile("C:\\Elon\\temp\\test.out", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 	checkErr(err)
 	for _, c := range nmap {
-		f.Write(c.chunkBuffer[:c.bufsize])
+		f.Write(c.chunk_buffer[:c.chunk_data_size])
 	}
 	f.Close()
 }
 
 func dec() {
 	all_files = make(map[uint64][]Chunk)
-	all_files_sync = make(map[uint64]*file_status)
-	read_chunks(*outDir)
+	all_files_sync = make(map[uint64]*FileStatus)
+	read_chunks(*arg_out_dir)
 
 	for k, _ := range all_files {
 		log.Debug("starting reconstruct for file ", k)
