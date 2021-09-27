@@ -101,6 +101,8 @@ type FileStatus struct {
 	num_parity_shards byte
 	num_total_shards  byte
 	shard_data_size   int
+	is_finished       bool
+	chunks            []Chunk
 }
 
 type FECFileEncoder struct {
@@ -132,9 +134,7 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 }
 
 type FECFileDecoder struct {
-	all_files      map[uint64][]Chunk
-	all_files_sync map[uint64]*FileStatus
-	new_file_mutex sync.Mutex
+	all_files map[uint64]*FileStatus
 }
 
 func newFECFileDecoder() *FECFileDecoder {
@@ -367,56 +367,54 @@ func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 	log.Debug("Finished")
 }
 
-func (dec *FECFileDecoder) read_shard(shard []byte) {
+func (dec *FECFileDecoder) put_shard(shard []byte) {
 	// read header from beginning
 	file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
 	log.Debug("shard header is ", file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards)
 
-	// lock when checking if new file arrived
-	dec.new_file_mutex.Lock()
+	// check if new file
 	if _, ok := dec.all_files[file_id]; !ok {
 		// NEW FILE - initialize chunk array and sync object
-		dec.all_files[file_id] = make([]Chunk, total_chunks)
-		dec.all_files_sync[file_id] = new(FileStatus)
+		dec.all_files[file_id] = new(FileStatus)
+		this_file := dec.all_files[file_id]
+		this_file.chunks = make([]Chunk, total_chunks)
 
-		file_chunks := dec.all_files[file_id]
-		stat := dec.all_files_sync[file_id]
-		stat.num_data_shards = num_data_shards
-		stat.num_parity_shards = num_parity_shards
-		stat.num_total_shards = num_data_shards + num_parity_shards
-		stat.file_size = file_size
-		stat.file_id = file_id
-		stat.total_chunks = int(total_chunks)
-		stat.shard_data_size = len(shard) - shard_header_size
+		file_chunks := this_file.chunks
+		this_file.num_data_shards = num_data_shards
+		this_file.num_parity_shards = num_parity_shards
+		this_file.num_total_shards = num_data_shards + num_parity_shards
+		this_file.file_size = file_size
+		this_file.file_id = file_id
+		this_file.total_chunks = int(total_chunks)
+		this_file.shard_data_size = len(shard) - shard_header_size
 
 		// initialize all chunks for this file
-		for j := 0; j < stat.total_chunks; j++ {
+		for j := 0; j < this_file.total_chunks; j++ {
 			// chunk_buffer holds the actual data of the chunk (without headers)
 			// NOTE: chunk_buffer is padded with zeros, actual size is in chunk_data_size
 			file_chunks[j].chunk_buffer = make([]byte,
-				int(stat.num_total_shards)*stat.shard_data_size)
+				int(this_file.num_total_shards)*this_file.shard_data_size)
 			file_chunks[j].chunk_idx = j
-			file_chunks[j].shards = make([][]byte, int(stat.num_total_shards))
+			file_chunks[j].shards = make([][]byte, int(this_file.num_total_shards))
 			// initialize all shards for this chunk
 			// each shard points to its slice in the chunk_buffer
-			for k := 0; k < int(stat.num_total_shards); k++ {
+			for k := 0; k < int(this_file.num_total_shards); k++ {
 				// Default is slice with zero length
 				// This is important for reconstruction, see docs for "reedsolomon.Reconstruct"
-				idx_start := stat.shard_data_size * k
+				idx_start := this_file.shard_data_size * k
 				file_chunks[j].shards[k] = file_chunks[j].chunk_buffer[idx_start:idx_start]
 			}
 		}
 	}
-	dec.new_file_mutex.Unlock()
 	// fill in chunk data
 	this_file := dec.all_files[file_id]
 	this_chunk := &this_file.chunks[chunk_idx]
 	this_chunk.chunk_data_size = int(chunk_data_size)
 	// copy shard data to chuckBuf
-	idx_start := int(shard_idx) * dec.all_files_sync[file_id].shard_data_size
-	idx_end := idx_start + dec.all_files_sync[file_id].shard_data_size
+	idx_start := int(shard_idx) * dec.all_files[file_id].shard_data_size
+	idx_end := idx_start + dec.all_files[file_id].shard_data_size
 	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shard_header_size:])
 
 	// make shard slice point to where the data is in chunk_buffer
@@ -436,23 +434,22 @@ func (dec *FECFileDecoder) read_chunks(foldername string) {
 		shard, err := ioutil.ReadFile(filename)
 		checkErr(err)
 
-		dec.read_shard(shard)
+		dec.put_shard(shard)
 	}
 }
 
 func (dec *FECFileDecoder) reconstruct_chunks(file_id uint64) {
 	// Create matrix
-	chunks := dec.all_files[file_id]
-	file_status := dec.all_files_sync[file_id]
-	enc, err := reedsolomon.New(int(file_status.num_data_shards), int(file_status.num_parity_shards))
+	this_file := dec.all_files[file_id]
+	enc, err := reedsolomon.New(int(this_file.num_data_shards), int(this_file.num_parity_shards))
 	checkErr(err)
-	for _, chunk := range chunks {
+	for _, chunk := range this_file.chunks {
 		ok, err := enc.Verify(chunk.shards)
 		if ok {
-			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_idx, file_status.total_chunks-1)
+			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_idx, this_file.total_chunks-1)
 		} else {
 			log.Debugf("Verification failed  chunk no. %d / %d. Reconstructing data",
-				chunk.chunk_idx, file_status.total_chunks-1)
+				chunk.chunk_idx, this_file.total_chunks-1)
 			err = enc.Reconstruct(chunk.shards)
 			if err != nil {
 				checkErr(err)
@@ -460,10 +457,10 @@ func (dec *FECFileDecoder) reconstruct_chunks(file_id uint64) {
 			ok, err = enc.Verify(chunk.shards)
 			if !ok {
 				log.Debugf("Reconstruction failed  chunk no. %d / %d. Reconstructing data",
-					chunk.chunk_idx, file_status.total_chunks-1)
+					chunk.chunk_idx, this_file.total_chunks-1)
 				checkErr(err)
 			}
-			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_idx, file_status.total_chunks-1)
+			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_idx, this_file.total_chunks-1)
 
 		}
 		checkErr(err)
@@ -472,13 +469,13 @@ func (dec *FECFileDecoder) reconstruct_chunks(file_id uint64) {
 
 func (dec *FECFileDecoder) recover_files(out_dir string) {
 
-	for id, file_chunks := range dec.all_files {
+	for id, file := range dec.all_files {
 		outfile_basename := fmt.Sprintf("%d.out", id)
 		outfile_fullname := filepath.Join(out_dir, outfile_basename)
 		f, err := os.OpenFile(outfile_fullname, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 		checkErr(err)
 		defer f.Close()
-		for _, chunk := range file_chunks {
+		for _, chunk := range file.chunks {
 			f.Write(chunk.chunk_buffer[:chunk.chunk_data_size])
 		}
 		log.Debugf("Wrote file to %s", outfile_fullname)
@@ -486,8 +483,7 @@ func (dec *FECFileDecoder) recover_files(out_dir string) {
 }
 
 func (dec *FECFileDecoder) decode(input_folder string, output_dir string) {
-	dec.all_files = make(map[uint64][]Chunk)
-	dec.all_files_sync = make(map[uint64]*FileStatus)
+	dec.all_files = make(map[uint64]*FileStatus)
 	dec.read_chunks(input_folder)
 
 	for k, _ := range dec.all_files {
