@@ -132,31 +132,13 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 }
 
 type FECFileDecoder struct {
-	num_data_shards    int
-	num_parity_shards  int
-	total_shards       int
-	full_shard_size    int
-	shard_data_size    int
-	total_chunk_buffer int
-	type_data          byte
-	type_parity        byte
-	max_chunk_size     int
-	all_files          map[uint64][]Chunk
-	all_files_sync     map[uint64]*FileStatus
-	new_file_mutex     sync.Mutex
+	all_files      map[uint64][]Chunk
+	all_files_sync map[uint64]*FileStatus
+	new_file_mutex sync.Mutex
 }
 
-func newFECFileDecoder(data_shards, parity_shards, full_shard_size int) *FECFileDecoder {
+func newFECFileDecoder() *FECFileDecoder {
 	dec := new(FECFileDecoder)
-	dec.num_data_shards = data_shards
-	dec.num_parity_shards = parity_shards
-	dec.total_shards = data_shards + parity_shards
-	dec.full_shard_size = full_shard_size
-	dec.shard_data_size = full_shard_size - shard_header_size
-	dec.total_chunk_buffer = dec.total_shards * dec.shard_data_size
-	dec.type_data = 0xf1
-	dec.type_parity = 0xf2
-	dec.max_chunk_size = dec.shard_data_size * dec.num_data_shards
 	return dec
 }
 
@@ -521,7 +503,7 @@ func main() {
 	flag.Parse()
 
 	encoder := newFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
-	decoder := newFECFileDecoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
+	decoder := newFECFileDecoder()
 
 	log.Debug("before encode")
 	encoder.encode(*arg_input_file, *arg_enc_out_dir)
