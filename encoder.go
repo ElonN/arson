@@ -49,7 +49,7 @@ import (
 )
 
 const (
-	shardHeaderSize = 32
+	shard_header_size = 32
 )
 
 var (
@@ -57,7 +57,7 @@ var (
 	arg_num_parity_shards = flag.Int("ps", 3, "Number of parity shards")
 	total_shards          = *arg_num_data_shards + *arg_num_parity_shards
 	arg_full_shard_size   = flag.Int("mss", 1300, "Maximum segment size to send (shard + header)")
-	shard_data_size       = *arg_full_shard_size - shardHeaderSize
+	shard_data_size       = *arg_full_shard_size - shard_header_size
 	total_chunk_buffer    = total_shards * shard_data_size
 	type_data             = 0xf1
 	type_parity           = 0xf2
@@ -285,15 +285,15 @@ func send_chunks(chunks []Chunk) error {
 					fatalErrors <- err
 					return
 				}
-				var header [shardHeaderSize]byte
+				var header [shard_header_size]byte
 				mark_shard_header(header[:], &c, j)
 				bytesWritten, err := f.Write(header[:])
 				if err != nil {
 					fatalErrors <- err
 				}
-				if bytesWritten != shardHeaderSize {
+				if bytesWritten != shard_header_size {
 					fatalErrors <- fmt.Errorf("get_chunks: shard %d at chunk %d read %d bytes (expected %d)",
-						j, i, bytesWritten, shardHeaderSize)
+						j, i, bytesWritten, shard_header_size)
 				}
 
 				f.Write(c.shards[j])
@@ -349,7 +349,7 @@ func enc() {
 func read_shard(shard []byte) {
 	// read header from beginning
 	file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
-		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shardHeaderSize])
+		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
 	log.Debug("shard header is ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards)
 	debug_file_id = file_id
@@ -369,7 +369,7 @@ func read_shard(shard []byte) {
 		stat.file_size = file_size
 		stat.file_id = file_id
 		stat.total_chunks = int(total_chunks)
-		stat.shard_data_size = len(shard) - shardHeaderSize
+		stat.shard_data_size = len(shard) - shard_header_size
 
 		// initialize all chunks for this file
 		for j := 0; j < stat.total_chunks; j++ {
@@ -396,7 +396,7 @@ func read_shard(shard []byte) {
 	// copy shard data to chuckBuf
 	idx_start := int(shard_idx) * all_files_sync[file_id].shard_data_size
 	idx_end := idx_start + all_files_sync[file_id].shard_data_size
-	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shardHeaderSize:])
+	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shard_header_size:])
 
 	// make shard slice point to where the data is in chunk_buffer
 	this_chunk.shards[shard_idx] = this_chunk.chunk_buffer[idx_start:idx_end]
