@@ -50,24 +50,17 @@ import (
 
 const (
 	shard_header_size = 32
+	type_data         = 0xf1
+	type_parity       = 0xf2
 )
 
 var (
 	arg_num_data_shards   = flag.Int("ds", 10, "Number of data shards")
 	arg_num_parity_shards = flag.Int("ps", 3, "Number of parity shards")
-	total_shards          = *arg_num_data_shards + *arg_num_parity_shards
 	arg_full_shard_size   = flag.Int("mss", 1300, "Maximum segment size to send (shard + header)")
-	shard_data_size       = *arg_full_shard_size - shard_header_size
-	total_chunk_buffer    = total_shards * shard_data_size
-	type_data             = 0xf1
-	type_parity           = 0xf2
 	arg_input_file        = flag.String("f", "", "Input file")
-	arg_out_dir           = flag.String("out", "", "Alternative output directory")
-	max_chunk_size        = shard_data_size * *arg_num_data_shards
-	all_files             map[uint64][]Chunk
-	all_files_sync        map[uint64]*FileStatus
-	new_file_mutex        sync.Mutex
-	debug_file_id         uint64
+	arg_enc_out_dir       = flag.String("eout", "", "Encoder output directory")
+	arg_dec_out_dir       = flag.String("dout", "", "Decoder output directory")
 )
 
 func init() {
@@ -89,15 +82,13 @@ func init() {
 }
 
 type Chunk struct {
-	chunk_data_size   int
-	chunk_idx         int
-	file_id           int
-	file_size         int
-	total_chunks      int
-	num_data_shards   byte
-	num_parity_shards byte
-	shards            [][]byte
-	chunk_buffer      []byte
+	chunk_data_size int
+	chunk_idx       int
+	file_id         int
+	file_size       int
+	total_chunks    int
+	shards          [][]byte
+	chunk_buffer    []byte
 }
 
 type FileStatus struct {
@@ -153,7 +144,6 @@ type FECFileDecoder struct {
 	all_files          map[uint64][]Chunk
 	all_files_sync     map[uint64]*FileStatus
 	new_file_mutex     sync.Mutex
-	debug_file_id      uint64
 }
 
 func newFECFileDecoder(data_shards, parity_shards, full_shard_size int) *FECFileDecoder {
@@ -395,23 +385,22 @@ func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 	log.Debug("Finished")
 }
 
-func read_shard(shard []byte) {
+func (dec *FECFileDecoder) read_shard(shard []byte) {
 	// read header from beginning
 	file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
 	log.Debug("shard header is ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards)
-	debug_file_id = file_id
 
 	// lock when checking if new file arrived
-	new_file_mutex.Lock()
-	if _, ok := all_files[file_id]; !ok {
+	dec.new_file_mutex.Lock()
+	if _, ok := dec.all_files[file_id]; !ok {
 		// NEW FILE - initialize chunk array and sync object
-		all_files[file_id] = make([]Chunk, total_chunks)
-		all_files_sync[file_id] = new(FileStatus)
+		dec.all_files[file_id] = make([]Chunk, total_chunks)
+		dec.all_files_sync[file_id] = new(FileStatus)
 
-		file_chunks := all_files[file_id]
-		stat := all_files_sync[file_id]
+		file_chunks := dec.all_files[file_id]
+		stat := dec.all_files_sync[file_id]
 		stat.num_data_shards = num_data_shards
 		stat.num_parity_shards = num_parity_shards
 		stat.num_total_shards = num_data_shards + num_parity_shards
@@ -438,13 +427,13 @@ func read_shard(shard []byte) {
 			}
 		}
 	}
-	new_file_mutex.Unlock()
+	dec.new_file_mutex.Unlock()
 	// fill in chunk data
-	this_chunk := &all_files[file_id][chunk_ord]
+	this_chunk := &dec.all_files[file_id][chunk_ord]
 	this_chunk.chunk_data_size = int(chunk_data_size)
 	// copy shard data to chuckBuf
-	idx_start := int(shard_idx) * all_files_sync[file_id].shard_data_size
-	idx_end := idx_start + all_files_sync[file_id].shard_data_size
+	idx_start := int(shard_idx) * dec.all_files_sync[file_id].shard_data_size
+	idx_end := idx_start + dec.all_files_sync[file_id].shard_data_size
 	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shard_header_size:])
 
 	// make shard slice point to where the data is in chunk_buffer
@@ -452,7 +441,7 @@ func read_shard(shard []byte) {
 
 }
 
-func read_chunks(foldername string) {
+func (dec *FECFileDecoder) read_chunks(foldername string) {
 	files, err := ioutil.ReadDir(foldername)
 	checkErr(err)
 
@@ -464,16 +453,14 @@ func read_chunks(foldername string) {
 		shard, err := ioutil.ReadFile(filename)
 		checkErr(err)
 
-		read_shard(shard)
+		dec.read_shard(shard)
 	}
-	ddd := all_files[debug_file_id]
-	_ = ddd
 }
 
-func reconstruct_chunks(file_id uint64) {
+func (dec *FECFileDecoder) reconstruct_chunks(file_id uint64) {
 	// Create matrix
-	chunks := all_files[file_id]
-	file_status := all_files_sync[file_id]
+	chunks := dec.all_files[file_id]
+	file_status := dec.all_files_sync[file_id]
 	enc, err := reedsolomon.New(int(file_status.num_data_shards), int(file_status.num_parity_shards))
 	checkErr(err)
 	for _, chunk := range chunks {
@@ -500,27 +487,32 @@ func reconstruct_chunks(file_id uint64) {
 	}
 }
 
-func recover_files() {
-	nmap := all_files[debug_file_id]
-	f, err := os.OpenFile("C:\\Elon\\temp\\test.out", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	checkErr(err)
-	for _, c := range nmap {
-		f.Write(c.chunk_buffer[:c.chunk_data_size])
+func (dec *FECFileDecoder) recover_files(out_dir string) {
+
+	for id, file_chunks := range dec.all_files {
+		outfile_basename := fmt.Sprintf("%d.out", id)
+		outfile_fullname := filepath.Join(out_dir, outfile_basename)
+		f, err := os.OpenFile(outfile_fullname, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+		checkErr(err)
+		defer f.Close()
+		for _, chunk := range file_chunks {
+			f.Write(chunk.chunk_buffer[:chunk.chunk_data_size])
+		}
+		log.Debugf("Wrote file to %s", outfile_fullname)
 	}
-	f.Close()
 }
 
-func dec() {
-	all_files = make(map[uint64][]Chunk)
-	all_files_sync = make(map[uint64]*FileStatus)
-	read_chunks(*arg_out_dir)
+func (dec *FECFileDecoder) decode(input_folder string, output_dir string) {
+	dec.all_files = make(map[uint64][]Chunk)
+	dec.all_files_sync = make(map[uint64]*FileStatus)
+	dec.read_chunks(input_folder)
 
-	for k, _ := range all_files {
+	for k, _ := range dec.all_files {
 		log.Debug("starting reconstruct for file ", k)
-		reconstruct_chunks(k)
+		dec.reconstruct_chunks(k)
 	}
 
-	recover_files()
+	dec.recover_files(output_dir)
 
 }
 
@@ -529,11 +521,12 @@ func main() {
 	flag.Parse()
 
 	encoder := newFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
+	decoder := newFECFileDecoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
 
 	log.Debug("before encode")
-	encoder.encode(*arg_input_file, *arg_out_dir)
+	encoder.encode(*arg_input_file, *arg_enc_out_dir)
 	log.Debug("before decode")
-	dec()
+	decoder.decode(*arg_enc_out_dir, *arg_dec_out_dir)
 	log.Debug("finish")
 }
 
