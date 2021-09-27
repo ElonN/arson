@@ -52,7 +52,7 @@ const (
 	numDataShards    = 10
 	numParShards     = 3
 	totalShards      = numDataShards + numParShards
-	shardHeaderSize  = 24
+	shardHeaderSize  = 32
 	fullShardSize    = 1300
 	shardDataSize    = fullShardSize - shardHeaderSize
 	totalChunkBuffer = totalShards * shardDataSize
@@ -64,7 +64,7 @@ var inputFile = flag.String("f", "", "Input file")
 var outDir = flag.String("out", "", "Alternative output directory")
 var maxChunkSize = shardDataSize * numDataShards
 var all_files map[uint64][]Chunk
-var all_files_sync map[uint64][]sync.WaitGroup
+var all_files_sync map[uint64]*file_status
 var new_file_mutex sync.Mutex
 var debug_file_id uint64
 
@@ -87,70 +87,70 @@ func init() {
 }
 
 type Chunk struct {
-	bufsize      int
-	chunk_ord    int
-	file_id      int
-	total_chunks int
-	shards       [][]byte
-	chunkBuffer  [totalChunkBuffer]byte
+	bufsize           int
+	chunk_ord         int
+	file_id           int
+	file_size         int
+	total_chunks      int
+	num_data_shards   byte
+	num_parity_shards byte
+	shards            [][]byte
+	chunkBuffer       []byte
 }
 
-func parse_shard_header(b []byte) (uint64, uint32, uint32, uint16, uint16, byte, byte) {
+type file_status struct {
+	bufsize           int
+	file_id           uint64
+	file_size         uint64
+	total_chunks      int
+	arrived_chunks    int
+	finished_chunks   int
+	num_data_shards   byte
+	num_parity_shards byte
+	num_total_shards  byte
+	shard_size        int
+	chunks_status     []sync.WaitGroup
+}
 
+func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_ord uint32,
+	total_chunks uint32, chunk_data_size uint32, shard_ord uint16, num_data_shards byte,
+	num_parity_shards byte) {
 	//
 	//The header format:
-	// |                      file_id(8B)                          |
-	// |      chunk_ord (4B)           |       total_chunks(4B)    |
-	// |shard_ord(2B)|shardDataSize(2B)|DS(1B)|PS(1B)| RESERVED(2B)|
+	// |                      file_id(8B)                         |
+	// |                      file_size(8B)                       |
+	// |      chunk_ord (4B)          |       total_chunks(4B)    |
+	// |	  chunk_data_size(4B)	  |shard_ord(2B)|DS(1B)|PS(1B)|
 	//
 	//
-	return binary.LittleEndian.Uint64(b),
-		binary.LittleEndian.Uint32(b[8:]),
-		binary.LittleEndian.Uint32(b[12:]),
-		binary.LittleEndian.Uint16(b[16:]),
-		binary.LittleEndian.Uint16(b[18:]),
-		byte(b[20]),
-		byte(b[21])
+	file_id = binary.LittleEndian.Uint64(b)
+	file_size = binary.LittleEndian.Uint64(b[8:])
+	chunk_ord = binary.LittleEndian.Uint32(b[16:])
+	total_chunks = binary.LittleEndian.Uint32(b[20:])
+	chunk_data_size = binary.LittleEndian.Uint32(b[24:])
+	shard_ord = binary.LittleEndian.Uint16(b[28:])
+	num_data_shards = byte(b[30])
+	num_parity_shards = byte(b[31])
+	return
 }
 
 func mark_shard_header(b []byte, c *Chunk, idx int) {
-
 	//
 	//The header format:
-	// |                      file_id(8B)                          |
-	// |      chunk_ord (4B)           |       total_chunks(4B)    |
-	// |shard_ord(2B)|shardDataSize(2B)|DS(1B)|PS(1B)| RESERVED(2B)|
+	// |                      file_id(8B)                         |
+	// |                      file_size(8B)                       |
+	// |      chunk_ord (4B)          |       total_chunks(4B)    |
+	// |	  chunk_data_size(4B)	  |shard_ord(2B)|DS(1B)|PS(1B)|
 	//
 	//
 	binary.LittleEndian.PutUint64(b, uint64(c.file_id))
-	binary.LittleEndian.PutUint32(b[8:], uint32(c.chunk_ord))
-	binary.LittleEndian.PutUint32(b[12:], uint32(c.total_chunks))
-	binary.LittleEndian.PutUint16(b[16:], uint16(idx))
-	//binary.LittleEndian.PutUint16(b[18:], uint16(shardSize))
-	//if c.chunk_ord == c.total_chunks-1 { // LAST CHUNK
-	// File data ends at some shard in the last chunk
-	// It looks something like this: (|-s-| is one data shard)
-	//
-	// |-s-|-s-|-s-| ... |-s-|-s-|-s-|-s-|-s-|-s-|-s-|
-	// |---file data-----------|--zeros--|---parity--|
-	//
-	// The first shards are full
-	// The last shards are zeros
-	// One special shard is partial
-	full_shards := c.bufsize / shardDataSize
-	remainder := c.bufsize % shardDataSize
-	var shard_data_size int
-	if idx > full_shards { // Empty shard
-		shard_data_size = 0
-	} else if idx == full_shards { // Partial shard
-		shard_data_size = remainder
-	} else { // Full shard
-		shard_data_size = shardDataSize
-	}
-	binary.LittleEndian.PutUint16(b[18:], uint16(shard_data_size))
-	//}
-	b[20] = uint8(numDataShards)
-	b[21] = uint8(numParShards)
+	binary.LittleEndian.PutUint64(b[8:], uint64(c.file_size))
+	binary.LittleEndian.PutUint32(b[16:], uint32(c.chunk_ord))
+	binary.LittleEndian.PutUint32(b[20:], uint32(c.total_chunks))
+	binary.LittleEndian.PutUint32(b[24:], uint32(c.bufsize))
+	binary.LittleEndian.PutUint16(b[28:], uint16(idx))
+	b[30] = uint8(numDataShards)
+	b[31] = uint8(numParShards)
 }
 
 func Min(x, y int64) int64 {
@@ -186,6 +186,8 @@ func get_chunks(filename string, chunk_size int, file_id int) ([]Chunk, error) {
 		chunks[i].chunk_ord = i
 		chunks[i].file_id = file_id
 		chunks[i].total_chunks = num_chunks
+		chunks[i].file_size = int(filesize)
+		chunks[i].chunkBuffer = make([]byte, totalShards*shardDataSize)
 	}
 	// last one is the remainder
 	chunks[num_chunks-1].bufsize = int(filesize) - chunks[num_chunks-1].chunk_ord*chunk_size
@@ -353,43 +355,50 @@ func read_chunks(foldername string) {
 		//go func(fi fs.FileInfo) {
 		filename := filepath.Join(foldername, f.Name())
 		log.Debug("Opening ", filename)
-		file, err := os.Open(filename)
+		packet, err := ioutil.ReadFile(filename)
 		checkErr(err)
-		defer file.Close()
 
-		var header [shardHeaderSize]byte
-		numRead, err := file.Read(header[:])
-		checkErr(err)
-		if numRead < shardHeaderSize {
-			checkErr(fmt.Errorf("read_chunks: file %s read %d bytes (expected %d)",
-				filename, numRead, shardHeaderSize))
-		}
-		file_id, chunk_ord, total_chunks, shard_ord, shard_data_size, ds, ps := parse_shard_header(header[:])
-		log.Debug("file ", filename, " has ", file_id, chunk_ord, total_chunks, shard_ord, shard_data_size, ds, ps)
+		file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+			shard_ord, num_data_shards, num_parity_shards := parse_shard_header(packet[:shardHeaderSize])
+		log.Debug("file ", filename, " has ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+			shard_ord, num_data_shards, num_parity_shards)
 		debug_file_id = file_id
 		// lock when adding new file
 		new_file_mutex.Lock()
 		if _, ok := all_files[file_id]; !ok {
 			all_files[file_id] = make([]Chunk, total_chunks)
-			all_files_sync[file_id] = make([]sync.WaitGroup, total_chunks)
-			for j, _ := range all_files_sync[file_id] {
-				all_files_sync[file_id][j].Add(totalShards)
+			all_files_sync[file_id] = new(file_status)
+			stat := all_files_sync[file_id]
+			stat.num_data_shards = num_data_shards
+			stat.num_parity_shards = num_parity_shards
+			stat.num_total_shards = num_data_shards + num_parity_shards
+			stat.file_size = file_size
+			stat.file_id = file_id
+			stat.total_chunks = int(total_chunks)
+			stat.shard_size = len(packet) - shardHeaderSize
+			all_files_sync[file_id].chunks_status = make([]sync.WaitGroup, total_chunks)
+			for j, _ := range all_files_sync[file_id].chunks_status {
+				all_files_sync[file_id].chunks_status[j].Add(int(stat.num_total_shards))
+				all_files[file_id][j].chunkBuffer = make([]byte,
+					int(stat.num_total_shards)*stat.shard_size)
+				all_files[file_id][j].chunk_ord = j
+				all_files[file_id][j].shards = make([][]byte, int(stat.num_total_shards))
+				for k := 0; k < int(stat.num_total_shards); k++ {
+					idx_start := shardDataSize * k
+					all_files[file_id][j].shards[k] = all_files[file_id][j].chunkBuffer[idx_start:idx_start]
+				}
 			}
 			//do something here
 		}
 		new_file_mutex.Unlock()
 
 		this_chunk := &all_files[file_id][chunk_ord]
-		this_chunk.bufsize += int(shard_data_size)
+		this_chunk.bufsize = int(chunk_data_size)
 		idx_start := shard_ord * shardDataSize
 		idx_end := (shard_ord + 1) * shardDataSize
-		numRead, err = file.Read(this_chunk.chunkBuffer[idx_start:idx_end])
-		checkErr(err)
-		if numRead < int(shardDataSize) {
-			checkErr(fmt.Errorf("read_chunks: file %s ,file_id %d, shard %d read %d bytes (expected %d)",
-				filename, file_id, shard_ord, numRead, shardDataSize))
-		}
-		all_files_sync[file_id][chunk_ord].Done()
+		copy(this_chunk.chunkBuffer[idx_start:idx_end], packet[shardHeaderSize:])
+		this_chunk.shards[shard_ord] = this_chunk.chunkBuffer[idx_start:idx_end]
+		all_files_sync[file_id].chunks_status[chunk_ord].Done()
 
 		//}(f)
 	}
@@ -397,9 +406,39 @@ func read_chunks(foldername string) {
 	_ = ddd
 }
 
+func reconstruct_chunks(file_id uint64) {
+	// Create matrix
+	chunks := all_files[file_id]
+	file_status := all_files_sync[file_id]
+	enc, err := reedsolomon.New(int(file_status.num_data_shards), int(file_status.num_parity_shards))
+	checkErr(err)
+	for _, chunk := range chunks {
+		ok, err := enc.Verify(chunk.shards)
+		if ok {
+			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_ord, file_status.total_chunks-1)
+		} else {
+			log.Debugf("Verification failed  chunk no. %d / %d. Reconstructing data",
+				chunk.chunk_ord, file_status.total_chunks-1)
+			err = enc.Reconstruct(chunk.shards)
+			if err != nil {
+				checkErr(err)
+			}
+			ok, err = enc.Verify(chunk.shards)
+			if !ok {
+				log.Debugf("Reconstruction failed  chunk no. %d / %d. Reconstructing data",
+					chunk.chunk_ord, file_status.total_chunks-1)
+				checkErr(err)
+			}
+			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_ord, file_status.total_chunks-1)
+
+		}
+		checkErr(err)
+	}
+}
+
 func recover_files() {
 	nmap := all_files[debug_file_id]
-	f, err := os.OpenFile("C:\\Elon\\temp\\nmap.out", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("C:\\Elon\\temp\\test.out", os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 	checkErr(err)
 	for _, c := range nmap {
 		f.Write(c.chunkBuffer[:c.bufsize])
@@ -409,10 +448,13 @@ func recover_files() {
 
 func dec() {
 	all_files = make(map[uint64][]Chunk)
-	all_files_sync = make(map[uint64][]sync.WaitGroup)
+	all_files_sync = make(map[uint64]*file_status)
 	read_chunks(*outDir)
 
-	//reconstruct_chunks()
+	for k, _ := range all_files {
+		log.Debug("starting reconstruct for file ", k)
+		reconstruct_chunks(k)
+	}
 
 	recover_files()
 
@@ -422,8 +464,11 @@ func main() {
 	// Parse command line parameters.
 	flag.Parse()
 
+	//log.Debug("before encode")
 	//enc()
+	log.Debug("before decode")
 	dec()
+	log.Debug("finish")
 }
 
 func checkErr(err error) {
