@@ -142,20 +142,20 @@ func newFECFileDecoder() *FECFileDecoder {
 	return dec
 }
 
-func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_ord uint32,
+func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_idx uint32,
 	total_chunks uint32, chunk_data_size uint32, shard_idx uint16, num_data_shards byte,
 	num_parity_shards byte) {
 	//
 	//The header format:
 	// |                      file_id(8B)                         |
 	// |                      file_size(8B)                       |
-	// |      chunk_ord (4B)          |       total_chunks(4B)    |
+	// |      chunk_idx (4B)          |       total_chunks(4B)    |
 	// |	  chunk_data_size(4B)	  |shard_idx(2B)|DS(1B)|PS(1B)|
 	//
 	//
 	file_id = binary.LittleEndian.Uint64(b)
 	file_size = binary.LittleEndian.Uint64(b[8:])
-	chunk_ord = binary.LittleEndian.Uint32(b[16:])
+	chunk_idx = binary.LittleEndian.Uint32(b[16:])
 	total_chunks = binary.LittleEndian.Uint32(b[20:])
 	chunk_data_size = binary.LittleEndian.Uint32(b[24:])
 	shard_idx = binary.LittleEndian.Uint16(b[28:])
@@ -247,7 +247,7 @@ func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id i
 			log.Debug("Read ", bytes_read, " / ", this_chunk.chunk_data_size, " bytes for chunk ", i)
 
 			if bytes_read != this_chunk.chunk_data_size {
-				fatalErrors <- fmt.Errorf("get_chunks: chunk %d at ordinal %d read %d bytes (expected %d)",
+				fatalErrors <- fmt.Errorf("get_chunks: chunk %d at index %d read %d bytes (expected %d)",
 					i, this_chunk.chunk_idx, bytes_read, this_chunk.chunk_data_size)
 			}
 			if err != nil {
@@ -369,9 +369,9 @@ func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 
 func (dec *FECFileDecoder) read_shard(shard []byte) {
 	// read header from beginning
-	file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+	file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
-	log.Debug("shard header is ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+	log.Debug("shard header is ", file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards)
 
 	// lock when checking if new file arrived
@@ -411,7 +411,8 @@ func (dec *FECFileDecoder) read_shard(shard []byte) {
 	}
 	dec.new_file_mutex.Unlock()
 	// fill in chunk data
-	this_chunk := &dec.all_files[file_id][chunk_ord]
+	this_file := dec.all_files[file_id]
+	this_chunk := &this_file.chunks[chunk_idx]
 	this_chunk.chunk_data_size = int(chunk_data_size)
 	// copy shard data to chuckBuf
 	idx_start := int(shard_idx) * dec.all_files_sync[file_id].shard_data_size
