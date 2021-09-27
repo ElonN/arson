@@ -346,60 +346,76 @@ func enc() {
 	log.Debug("Finished")
 }
 
+func read_shard(shard []byte) {
+	// read header from beginning
+	file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shardHeaderSize])
+	log.Debug("shard header is ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
+		shard_idx, num_data_shards, num_parity_shards)
+	debug_file_id = file_id
+
+	// lock when checking if new file arrived
+	new_file_mutex.Lock()
+	if _, ok := all_files[file_id]; !ok {
+		// NEW FILE - initialize chunk array and sync object
+		all_files[file_id] = make([]Chunk, total_chunks)
+		all_files_sync[file_id] = new(FileStatus)
+
+		file_chunks := all_files[file_id]
+		stat := all_files_sync[file_id]
+		stat.num_data_shards = num_data_shards
+		stat.num_parity_shards = num_parity_shards
+		stat.num_total_shards = num_data_shards + num_parity_shards
+		stat.file_size = file_size
+		stat.file_id = file_id
+		stat.total_chunks = int(total_chunks)
+		stat.shard_data_size = len(shard) - shardHeaderSize
+
+		// initialize all chunks for this file
+		for j := 0; j < stat.total_chunks; j++ {
+			// chunk_buffer holds the actual data of the chunk (without headers)
+			// NOTE: chunk_buffer is padded with zeros, actual size is in chunk_data_size
+			file_chunks[j].chunk_buffer = make([]byte,
+				int(stat.num_total_shards)*stat.shard_data_size)
+			file_chunks[j].chunk_idx = j
+			file_chunks[j].shards = make([][]byte, int(stat.num_total_shards))
+			// initialize all shards for this chunk
+			// each shard points to its slice in the chunk_buffer
+			for k := 0; k < int(stat.num_total_shards); k++ {
+				// Default is slice with zero length
+				// This is important for reconstruction, see docs for "reedsolomon.Reconstruct"
+				idx_start := stat.shard_data_size * k
+				file_chunks[j].shards[k] = file_chunks[j].chunk_buffer[idx_start:idx_start]
+			}
+		}
+	}
+	new_file_mutex.Unlock()
+	// fill in chunk data
+	this_chunk := &all_files[file_id][chunk_ord]
+	this_chunk.chunk_data_size = int(chunk_data_size)
+	// copy shard data to chuckBuf
+	idx_start := int(shard_idx) * all_files_sync[file_id].shard_data_size
+	idx_end := idx_start + all_files_sync[file_id].shard_data_size
+	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shardHeaderSize:])
+
+	// make shard slice point to where the data is in chunk_buffer
+	this_chunk.shards[shard_idx] = this_chunk.chunk_buffer[idx_start:idx_end]
+
+}
+
 func read_chunks(foldername string) {
 	files, err := ioutil.ReadDir(foldername)
 	checkErr(err)
 
 	for _, f := range files {
-		//go func(fi fs.FileInfo) {
+
 		filename := filepath.Join(foldername, f.Name())
+
 		log.Debug("Opening ", filename)
-		packet, err := ioutil.ReadFile(filename)
+		shard, err := ioutil.ReadFile(filename)
 		checkErr(err)
 
-		file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
-			shard_ord, num_data_shards, num_parity_shards := parse_shard_header(packet[:shardHeaderSize])
-		log.Debug("file ", filename, " has ", file_id, file_size, chunk_ord, total_chunks, chunk_data_size,
-			shard_ord, num_data_shards, num_parity_shards)
-		debug_file_id = file_id
-		// lock when adding new file
-		new_file_mutex.Lock()
-		if _, ok := all_files[file_id]; !ok {
-			all_files[file_id] = make([]Chunk, total_chunks)
-			all_files_sync[file_id] = new(file_status)
-			stat := all_files_sync[file_id]
-			stat.num_data_shards = num_data_shards
-			stat.num_parity_shards = num_parity_shards
-			stat.num_total_shards = num_data_shards + num_parity_shards
-			stat.file_size = file_size
-			stat.file_id = file_id
-			stat.total_chunks = int(total_chunks)
-			stat.shard_size = len(packet) - shardHeaderSize
-			all_files_sync[file_id].chunks_status = make([]sync.WaitGroup, total_chunks)
-			for j, _ := range all_files_sync[file_id].chunks_status {
-				all_files_sync[file_id].chunks_status[j].Add(int(stat.num_total_shards))
-				all_files[file_id][j].chunkBuffer = make([]byte,
-					int(stat.num_total_shards)*stat.shard_size)
-				all_files[file_id][j].chunk_ord = j
-				all_files[file_id][j].shards = make([][]byte, int(stat.num_total_shards))
-				for k := 0; k < int(stat.num_total_shards); k++ {
-					idx_start := shardDataSize * k
-					all_files[file_id][j].shards[k] = all_files[file_id][j].chunkBuffer[idx_start:idx_start]
-				}
-			}
-			//do something here
-		}
-		new_file_mutex.Unlock()
-
-		this_chunk := &all_files[file_id][chunk_ord]
-		this_chunk.bufsize = int(chunk_data_size)
-		idx_start := shard_ord * shardDataSize
-		idx_end := (shard_ord + 1) * shardDataSize
-		copy(this_chunk.chunkBuffer[idx_start:idx_end], packet[shardHeaderSize:])
-		this_chunk.shards[shard_ord] = this_chunk.chunkBuffer[idx_start:idx_end]
-		all_files_sync[file_id].chunks_status[chunk_ord].Done()
-
-		//}(f)
+		read_shard(shard)
 	}
 	ddd := all_files[debug_file_id]
 	_ = ddd
