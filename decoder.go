@@ -37,6 +37,15 @@ type FECFileDecoder struct {
 	output_folder string
 }
 
+// Returns a new file decoder. Each decoder instance has its own context and should
+// not be used concurrently.
+// Decoder can listen on a reader stream. Every new completed file is recontructed
+// and written to output folder with the name <id>.out where <id> is int64 decided by
+// the encoder.
+// Every file sent has it's data reconstructed (if possible) but metadata is lost.
+// That means that if file name or permissions need to be perserved, one should
+// embed them in file data.
+// chunk_timeout is the amount of time that a uncompleted chunk can accept new shards.
 func NewFECFileDecoder(chunk_timeout int64, output_folder string) *FECFileDecoder {
 	dec := new(FECFileDecoder)
 	dec.all_files = make(map[uint64]*FileStatus)
@@ -69,15 +78,15 @@ func parse_shard_header(b []byte) (file_id uint64, chunk_idx uint32, total_chunk
 	return
 }
 
+// helps garbage collector
 func (fs *FileStatus) free_file() {
-
 	for i := range fs.chunks {
 		fs.chunks[i].shards = nil
 		fs.chunks[i].chunk_buffer = nil
 	}
-
 }
 
+// add shards continously
 func (dec *FECFileDecoder) put_shard(shard []byte) {
 	// read header from beginning
 	file_id, chunk_idx, total_chunks, chunk_size,
