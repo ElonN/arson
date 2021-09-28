@@ -2,7 +2,8 @@
 ![Image of Flame](https://static.wikia.nocookie.net/pam-rpg-system/images/3/30/Fire.png)
 
 # arson
-Use [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilize it for large files
+Package for applying [Reed-Solomon error correction](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction) for reliable one-way data transfer.
+It uses [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilizes extra functionality essential for data transfer
 
 From Klaus' documentation about shortcomings of his [simple encoder/decoder](https://github.com/klauspost/reedsolomon/tree/master/examples):
 
