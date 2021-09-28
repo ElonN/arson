@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/klauspost/reedsolomon"
@@ -36,7 +37,7 @@ func NewFECFileEncoder(data_shards, parity_shards, max_shard_size int) *FECFileE
 	enc.shard_data_size = max_shard_size - shard_header_size
 	enc.total_chunk_buffer = enc.num_total_shards * enc.shard_data_size
 	enc.max_chunk_size = enc.shard_data_size * int(enc.num_data_shards)
-	enc.idGen, _ = snowflake.NewNode(1)
+	enc.idGen, _ = snowflake.NewNode(time.Now().Unix() % 255)
 	return enc
 }
 
