@@ -614,9 +614,6 @@ func (dec *FECFileDecoder) decode_from_file(filename string) error {
 	}
 	defer file.Close()
 
-	// start buffered read
-	// first - sequentially reads chunks form file
-	// then - spawns goroutines and encodes chunks concurrently
 	buffered_reader := bufio.NewReader(file)
 	dec.Decode(buffered_reader)
 	return nil
@@ -688,9 +685,18 @@ func main() {
 	encoder.EncodeStream(*arg_input_file, buffered_writer)
 	out_file_encoder.Close()
 
-	decoder := NewFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
 	log.Debug("before decode")
-	//decoder.decode_from_folder(*arg_enc_out_dir)
-	decoder.decode_from_file(*arg_enc_out_file)
-	log.Debug("finish")
+	decoder := NewFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
+	filename := *arg_enc_out_file
+	log.Debug("Opening ", filename)
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	defer file.Close()
+
+	buffered_reader := bufio.NewReader(file)
+	decoder.Decode(buffered_reader)
+	log.Debug("exiting main")
 }
