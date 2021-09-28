@@ -70,7 +70,7 @@ func (enc *FECFileEncoder) get_all_shards() [][]byte {
 // Encodes file <filename> and returns slice that has all shards
 // The resulting shards will be at most max_shard_size and will
 // have all data needed for reconstruction embedded in their content.
-// all shards will remain in memory so for large file consider using
+// All shards will remain in memory so for large files consider using
 // other methods - EncodeToStream or EncodeToFolder
 func (enc *FECFileEncoder) Encode(filename string) ([][]byte, error) {
 	err := enc.encode_internal(filename, "", nil)
@@ -84,7 +84,7 @@ func (enc *FECFileEncoder) Encode(filename string) ([][]byte, error) {
 // The resulting shards will be at most max_shard_size and will
 // have all data needed for reconstruction embedded in their content.
 // i.e their filenames are not necesarry and can be changed.
-// File will be read chunk by chunk so that even large files will
+// File will be read and written chunk by chunk so that even large files will
 // have reasonable memory consumption
 func (enc *FECFileEncoder) EncodeToFolder(filename string, output_dir string) error {
 	err := enc.encode_internal(filename, output_dir, nil)
@@ -97,7 +97,7 @@ func (enc *FECFileEncoder) EncodeToFolder(filename string, output_dir string) er
 // Encodes file <filename> to shards and streams them to io.writer.
 // The resulting shards will be at most max_shard_size and will
 // have all data needed for reconstruction embedded in their content.
-// File will be read chunk by chunk so that even large files will
+// File will be read and streamed chunk by chunk so that even large files will
 // have reasonable memory consumption
 func (enc *FECFileEncoder) EncodeToStream(filename string, writer io.Writer) error {
 	if writer == nil {
