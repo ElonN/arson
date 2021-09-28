@@ -65,6 +65,7 @@ var (
 	arg_chunk_timeout     = flag.Int("to", 60, "Timeout for receiving chunks (in seconds)")
 	arg_input_file        = flag.String("f", "", "Input file")
 	arg_enc_out_dir       = flag.String("eout", "", "Encoder output directory")
+	arg_enc_out_file      = flag.String("eoutfile", "", "Encoder output file")
 	arg_dec_out_dir       = flag.String("dout", "", "Decoder output directory")
 )
 
@@ -100,6 +101,7 @@ type Chunk struct {
 	timestamp           int64
 	num_data_shards     int
 	num_parity_shards   int
+	num_total_shards    int
 	shard_data_size     int
 	zero_padding_length int
 	shard_header        [shard_header_size]byte
@@ -109,8 +111,6 @@ type FileStatus struct {
 	file_id             uint64
 	file_size           int64
 	total_chunks        int
-	arrived_chunks      int
-	finished_chunks     int
 	num_data_shards     int
 	num_parity_shards   int
 	num_total_shards    int
@@ -127,7 +127,7 @@ type FileStatus struct {
 type FECFileEncoder struct {
 	num_data_shards    int
 	num_parity_shards  int
-	total_shards       int
+	num_total_shards   int
 	full_shard_size    int
 	shard_data_size    int
 	total_chunk_buffer int
@@ -141,10 +141,10 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 	enc := new(FECFileEncoder)
 	enc.num_data_shards = data_shards
 	enc.num_parity_shards = parity_shards
-	enc.total_shards = data_shards + parity_shards
+	enc.num_total_shards = data_shards + parity_shards
 	enc.full_shard_size = full_shard_size
 	enc.shard_data_size = full_shard_size - shard_header_size
-	enc.total_chunk_buffer = enc.total_shards * enc.shard_data_size
+	enc.total_chunk_buffer = enc.num_total_shards * enc.shard_data_size
 	enc.type_data = 0xf1
 	enc.type_parity = 0xf2
 	enc.max_chunk_size = enc.shard_data_size * int(enc.num_data_shards)
@@ -189,7 +189,10 @@ func parse_shard_header(b []byte) (file_id uint64, chunk_idx uint32, total_chunk
 	zero_padding_length = binary.LittleEndian.Uint32(b[28:])
 	return
 }
-
+func (chunk *Chunk) free() {
+	chunk.shards = nil
+	chunk.chunk_buffer = nil
+}
 func (chunk *Chunk) fill_shard_header() error {
 	//
 	//The header format:
@@ -227,7 +230,31 @@ func Min(x, y int64) int64 {
 	return y
 }
 
-func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_base string) error {
+func send_chunks_to_io(writer *bufio.Writer, cin chan *Chunk,
+	done chan bool, fatal_errors chan error) {
+	log.Debug("Starting to send chunks - listening on channel")
+	for chunk := range cin {
+		log.Debugf("send_chunks_to_io received chunk %d from channel", chunk.chunk_idx)
+		for j := 0; j < chunk.num_total_shards; j++ {
+			b := chunk.shard_header
+			b[1] = byte(j) // fill shard_idx in shard header
+			_, err := writer.Write(b[:])
+			if err != nil {
+				fatal_errors <- err
+			}
+			_, err = writer.Write(chunk.shards[j])
+			if err != nil {
+				fatal_errors <- err
+			}
+			log.Debugf("Finished writing chunk.shard %d.%d", chunk.chunk_idx, j)
+		}
+		chunk.free()
+	}
+	log.Debug("Finished sending chunks - channel closed")
+	done <- true
+}
+
+func (enc *FECFileEncoder) encode(filename string, writer *bufio.Writer) error {
 	file_id := uint64(enc.idGen.Generate())
 	log.Debug("Opening ", filename)
 	file, err := os.Open(filename)
@@ -241,6 +268,7 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 		return err
 	}
 
+	chunk_size := enc.max_chunk_size
 	filesize := fileinfo.Size()
 	log.Debug("File size of ", filename, " is ", filesize)
 	log.Debug("Chunk size is ", chunk_size)
@@ -255,9 +283,10 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 		chunks[i].file_id = file_id
 		chunks[i].total_chunks = num_chunks
 		chunks[i].file_size = filesize
-		chunks[i].chunk_buffer = make([]byte, enc.total_shards*enc.shard_data_size)
+		chunks[i].chunk_buffer = make([]byte, enc.num_total_shards*enc.shard_data_size)
 		chunks[i].num_data_shards = enc.num_data_shards
 		chunks[i].num_parity_shards = enc.num_parity_shards
+		chunks[i].num_total_shards = enc.num_total_shards
 		chunks[i].shard_data_size = enc.shard_data_size
 		chunks[i].zero_padding_length = num_chunks*chunk_size - int(filesize)
 
@@ -268,8 +297,10 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 	}
 
 	// Make channels to pass fatal errors in WaitGroup
-	fatalErrors := make(chan error)
+	fatal_errors := make(chan error)
 	wgDone := make(chan bool)
+	chunk_channel := make(chan *Chunk)
+	write_done_channel := make(chan bool)
 
 	var wg sync.WaitGroup
 	wg.Add(num_chunks)
@@ -304,8 +335,8 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 			log.Debug("Inside chunk goroutine number ", chunk.chunk_idx)
 
 			// "shards" are slices from chunk_buffer
-			chunk.shards = make([][]byte, enc.total_shards)
-			for j := 0; j < enc.total_shards; j++ {
+			chunk.shards = make([][]byte, enc.num_total_shards)
+			for j := 0; j < enc.num_total_shards; j++ {
 				idx_start := enc.shard_data_size * j
 				idx_end := idx_start + enc.shard_data_size
 				chunk.shards[j] = chunk.chunk_buffer[idx_start:idx_end]
@@ -314,23 +345,19 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 			// Create encoding matrix
 			encoder, err := reedsolomon.New(enc.num_data_shards, enc.num_parity_shards)
 			if err != nil {
-				fatalErrors <- err
+				fatal_errors <- err
 			}
 			// perform the encode - create parity shards
 			err = encoder.Encode(chunk.shards)
 			if err != nil {
-				fatalErrors <- err
+				fatal_errors <- err
 			}
-			out_file_chunk, err := os.OpenFile(fmt.Sprintf("%s.%04d", out_base, chunk.chunk_idx),
-				os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				fatalErrors <- err
-			}
-			defer out_file_chunk.Close()
-			buffered_writer := bufio.NewWriterSize(out_file_chunk, enc.full_shard_size)
-			enc.handle_shards(chunk, buffered_writer)
+			chunk_channel <- chunk
+
 		}(this_chunk)
 	}
+
+	go send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
 
 	// Important final goroutine to wait until WaitGroup is done
 	go func() {
@@ -342,33 +369,31 @@ func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_ba
 	select {
 	case <-wgDone:
 		// carry on
+		log.Debug("waitgroup finished")
+		close(chunk_channel)
 		break
-	case err := <-fatalErrors:
+	case err := <-fatal_errors:
+		log.Debug("got fatal error from channel")
 		wg.Wait()
 		return err
 	}
+
+	select {
+	case <-write_done_channel: // write goroutine finished
+		log.Debug("got finish signal from writing routine")
+		break
+	case err := <-fatal_errors:
+		log.Debug("got fatal error from channel")
+		wg.Wait()
+		return err
+	}
+
 	return nil
 }
 
 /*
-func shard_callback(shard []byte, out_file string) error {
-
-	log.Debugf("inside callback is in: %s", out_file)
-	f, err := os.OpenFile(out_file,
-		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(shard)
-	if err != nil {
-		return err
-	}
-	f.Close()
-	return nil
-}*/
-
 func (enc *FECFileEncoder) handle_shards(chunk *Chunk, w io.Writer) error {
-	for j := 0; j < enc.total_shards; j++ {
+	for j := 0; j < enc.num_total_shards; j++ {
 		b := chunk.shard_header
 		b[1] = byte(j) // fill shard_idx in shard header
 		_, err := w.Write(b[:])
@@ -383,66 +408,13 @@ func (enc *FECFileEncoder) handle_shards(chunk *Chunk, w io.Writer) error {
 	return nil
 }
 
-/*func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string,
-	callback func([]byte, string) error) error {
+func (enc *FECFileEncoder) encode_to_files(filename string, out_dir string) {
 
-	log.Debugf("OUTPUT is in: %s.%04d", out_base, 1)
-
-	// Make channels to pass fatal errors in WaitGroup
-	fatalErrors := make(chan error)
-	wgDone := make(chan bool)
-
-	var wg sync.WaitGroup
-	wg.Add(len(chunks))
-
-	log.Debug("Starting sending goroutines")
-	for i, c := range chunks {
-		go func(i int, c Chunk) {
-			log.Debug("Inside sending goroutine number ", i)
-
-			for j := 0; j < enc.total_shards; j++ {
-				var header [shard_header_size]byte
-				enc.mark_shard_header(header[:], &c, j)
-				full_shard := make([]byte, shard_header_size+len(c.shards[j]))
-				copy(full_shard[:shard_header_size], header[:])
-				copy(full_shard[shard_header_size:], c.shards[j])
-				//fatalErrors <-
-				err := callback(full_shard, fmt.Sprintf("%s.%04d.%04d", out_base, i, j))
-				if err != nil {
-					fatalErrors <- err
-				}
-			}
-
-			log.Debug("Finished sending goroutine number ", i)
-			wg.Done()
-		}(i, c)
-	}
-	// Important final goroutine to wait until WaitGroup is done
-	go func() {
-		wg.Wait()
-		close(wgDone)
-	}()
-
-	// Wait until either WaitGroup is done or an error is received through the channel
-	select {
-	case <-wgDone:
-		// carry on
-		break
-	case err := <-fatalErrors:
-		wg.Wait()
-		return err
-	}
-	log.Debug("Finished send_chunks")
-	return nil
-}*/
-
-func (enc *FECFileEncoder) encode(filename string, out_dir string) {
-
-	err := enc.encode_chunks(filename, enc.max_chunk_size, filepath.Join(out_dir, filepath.Base(filename)))
+	err := enc.encode_chunks(filename, filepath.Join(out_dir, filepath.Base(filename)))
 	checkErr(err)
 
 	log.Debug("Finished")
-}
+} */
 
 func (fs *FileStatus) free_file() {
 
@@ -621,6 +593,21 @@ func (dec *FECFileDecoder) read_shards(r *bufio.Reader) error {
 		dec.put_shard(shard_buf)
 	}
 }
+func (dec *FECFileDecoder) decode_from_file(filename string) error {
+	log.Debug("Opening ", filename)
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// start buffered read
+	// first - sequentially reads chunks form file
+	// then - spawns goroutines and encodes chunks concurrently
+	buffered_reader := bufio.NewReader(file)
+	dec.read_shards(buffered_reader)
+	return nil
+}
 
 func (dec *FECFileDecoder) decode_from_folder(input_folder string) error {
 	files, err := ioutil.ReadDir(input_folder)
@@ -629,21 +616,8 @@ func (dec *FECFileDecoder) decode_from_folder(input_folder string) error {
 	}
 
 	for _, f := range files {
-
 		filename := filepath.Join(input_folder, f.Name())
-
-		log.Debug("Opening ", filename)
-		file, err := os.Open(filename)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		// start buffered read
-		// first - sequentially reads chunks form file
-		// then - spawns goroutines and encodes chunks concurrently
-		buffered_reader := bufio.NewReader(file)
-		dec.read_shards(buffered_reader)
+		dec.decode_from_file(filename)
 	}
 	return nil
 }
@@ -685,13 +659,22 @@ func main() {
 	// Parse command line parameters.
 	flag.Parse()
 
+	out_file_encoder, err := os.OpenFile(*arg_enc_out_file,
+		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	checkErr(err)
+
+	buffered_writer := bufio.NewWriterSize(out_file_encoder, *arg_full_shard_size)
+
 	encoder := newFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
 	log.Debug("before encode")
-	encoder.encode(*arg_input_file, *arg_enc_out_dir)
+	encoder.encode(*arg_input_file, buffered_writer)
+	buffered_writer.Flush()
+	out_file_encoder.Close()
 
 	decoder := newFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
 	log.Debug("before decode")
-	decoder.decode_from_folder(*arg_enc_out_dir)
+	//decoder.decode_from_folder(*arg_enc_out_dir)
+	decoder.decode_from_file(*arg_enc_out_file)
 	log.Debug("finish")
 }
 
