@@ -676,7 +676,10 @@ func main() {
 
 	out_file_encoder, err := os.OpenFile(*arg_enc_out_file,
 		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	checkErr(err)
+	if err != nil {
+		log.Error(err)
+		return
+	}
 
 	buffered_writer := bufio.NewWriter(out_file_encoder)
 
@@ -690,11 +693,4 @@ func main() {
 	//decoder.decode_from_folder(*arg_enc_out_dir)
 	decoder.decode_from_file(*arg_enc_out_file)
 	log.Debug("finish")
-}
-
-func checkErr(err error) {
-	if err != nil {
-		log.Error(err)
-		os.Exit(2)
-	}
 }
