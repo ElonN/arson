@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/klauspost/reedsolomon"
@@ -58,6 +59,7 @@ var (
 	arg_num_data_shards   = flag.Int("ds", 10, "Number of data shards")
 	arg_num_parity_shards = flag.Int("ps", 3, "Number of parity shards")
 	arg_full_shard_size   = flag.Int("mss", 1300, "Maximum segment size to send (shard + header)")
+	arg_chunk_timeout     = flag.Int("to", 60, "Timeout for receiving chunks (in seconds)")
 	arg_input_file        = flag.String("f", "", "Input file")
 	arg_enc_out_dir       = flag.String("eout", "", "Encoder output directory")
 	arg_dec_out_dir       = flag.String("dout", "", "Decoder output directory")
@@ -82,13 +84,17 @@ func init() {
 }
 
 type Chunk struct {
-	chunk_data_size int
-	chunk_idx       int
-	file_id         int
-	file_size       int
-	total_chunks    int
-	shards          [][]byte
-	chunk_buffer    []byte
+	chunk_data_size     int
+	chunk_idx           int
+	file_id             int
+	file_size           int
+	total_chunks        int
+	shards              [][]byte
+	chunk_buffer        []byte
+	is_finished         bool
+	arrived_shards      int
+	arrived_data_shards int
+	timestamp           int64
 }
 
 type FileStatus struct {
@@ -102,6 +108,8 @@ type FileStatus struct {
 	num_total_shards  byte
 	shard_data_size   int
 	is_finished       bool
+	is_failed         bool
+	timestamp         int64
 	chunks            []Chunk
 }
 
@@ -134,11 +142,13 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 }
 
 type FECFileDecoder struct {
-	all_files map[uint64]*FileStatus
+	all_files     map[uint64]*FileStatus
+	chunk_timeout int64
 }
 
-func newFECFileDecoder() *FECFileDecoder {
+func newFECFileDecoder(chunk_timeout int64) *FECFileDecoder {
 	dec := new(FECFileDecoder)
+	dec.chunk_timeout = chunk_timeout
 	return dec
 }
 
@@ -367,7 +377,16 @@ func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 	log.Debug("Finished")
 }
 
-func (dec *FECFileDecoder) put_shard(shard []byte) {
+func (fs *FileStatus) free_file() {
+
+	for i := range fs.chunks {
+		fs.chunks[i].shards = nil
+		fs.chunks[i].chunk_buffer = nil
+	}
+
+}
+
+func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 	// read header from beginning
 	file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
 		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
@@ -407,12 +426,43 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 				file_chunks[j].shards[k] = file_chunks[j].chunk_buffer[idx_start:idx_start]
 			}
 		}
+
+		// mark timestamp for file arrival start
+		this_file.timestamp = time.Now().Unix()
 	}
-	// fill in chunk data
+
 	this_file := dec.all_files[file_id]
+	if this_file.is_finished {
+		log.Warn("shard arrived for already finished file")
+		return
+	}
+	if this_file.is_failed {
+		log.Warn("shard arrived for already failed file")
+		return
+	}
+
+	// now we know that the file exists, we will handle the specific shard
+	// that has arrived. first, let's fill in chunk data.
 	this_chunk := &this_file.chunks[chunk_idx]
-	this_chunk.chunk_data_size = int(chunk_data_size)
-	// copy shard data to chuckBuf
+	if this_chunk.is_finished {
+		log.Warn("shard arrived for already finished chunk")
+		return
+	}
+	if this_chunk.timestamp == 0 {
+		this_chunk.timestamp = time.Now().Unix()
+	}
+	if this_chunk.chunk_data_size == 0 {
+		this_chunk.chunk_data_size = int(chunk_data_size)
+	}
+	// if now is after timeout for chunk
+	if time.Now().Unix() > this_chunk.timestamp+dec.chunk_timeout {
+		log.Warnf("shard arrived for timed out chunk %d of file %d", chunk_idx, file_id)
+		this_file.is_failed = true
+		this_file.free_file()
+		return
+	}
+
+	// copy shard data to chunk_buffer
 	idx_start := int(shard_idx) * dec.all_files[file_id].shard_data_size
 	idx_end := idx_start + dec.all_files[file_id].shard_data_size
 	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shard_header_size:])
@@ -420,79 +470,97 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 	// make shard slice point to where the data is in chunk_buffer
 	this_chunk.shards[shard_idx] = this_chunk.chunk_buffer[idx_start:idx_end]
 
+	// keep track how many shards have arrived
+	this_chunk.arrived_shards++
+	if shard_idx < uint16(num_data_shards) {
+		this_chunk.arrived_data_shards++
+	}
+
+	// check if we can reconstruct
+	if this_chunk.arrived_shards >= int(num_data_shards) {
+		// case 1 - all data shards arrived
+		if this_chunk.arrived_data_shards == int(num_data_shards) {
+			log.Debugf("all data shards arrived for file: %d chunk: %d",
+				file_id, chunk_idx)
+		} else {
+			// case 2 - not all data shards have arrived,
+			//          but they can be reconstructed
+			log.Debugf("not all data shards arrived for file: %d chunk: %d, arrived %d / %d data shards",
+				file_id, chunk_idx, this_chunk.arrived_data_shards, num_data_shards)
+			rs, err := reedsolomon.New(int(this_file.num_data_shards),
+				int(this_file.num_parity_shards))
+			if err != nil {
+				log.Error("reed solomon cannot be contructed: ", err)
+				return
+			}
+
+			err = rs.Reconstruct(this_chunk.shards)
+			if err != nil {
+				log.Error("reconstruction failed: ", err)
+				return
+			}
+
+		}
+		log.Debugf("Finished file %d chunk %d, writing to output dir: %s",
+			file_id, chunk_idx, output_folder)
+		this_file.write_chunk(int(chunk_idx), output_folder)
+		this_chunk.is_finished = true
+	}
+
 }
 
-func (dec *FECFileDecoder) read_chunks(foldername string) {
-	files, err := ioutil.ReadDir(foldername)
+func (dec *FECFileDecoder) read_chunks(input_folder, output_folder string) {
+	files, err := ioutil.ReadDir(input_folder)
 	checkErr(err)
 
 	for _, f := range files {
 
-		filename := filepath.Join(foldername, f.Name())
+		filename := filepath.Join(input_folder, f.Name())
 
 		log.Debug("Opening ", filename)
 		shard, err := ioutil.ReadFile(filename)
 		checkErr(err)
 
-		dec.put_shard(shard)
+		dec.put_shard(shard, output_folder)
 	}
 }
 
-func (dec *FECFileDecoder) reconstruct_chunks(file_id uint64) {
-	// Create matrix
-	this_file := dec.all_files[file_id]
-	enc, err := reedsolomon.New(int(this_file.num_data_shards), int(this_file.num_parity_shards))
+func (fs *FileStatus) write_chunk(chunk_idx int, out_dir string) error {
+	outfile_basename := fmt.Sprintf("%d.out", fs.file_id)
+	outfile_fullname := filepath.Join(out_dir, outfile_basename)
+	chunk := fs.chunks[chunk_idx]
+	offset := chunk_idx * chunk.chunk_data_size
+	if chunk_idx == fs.total_chunks-1 {
+		// special case
+		// if this is the last chunk, then chunk_data_size is remainder (file_size % max_chunk_size)
+		// this means the offset cannot be calculated as above (chunk_idx * chunk_data_size)
+		// luckily, for last chunk we can simply subtract chunk_data_size from total file size
+		// this works even if the file is divided perfectly to equal size chunks (no remainder)
+		offset = int(fs.file_size) - chunk.chunk_data_size
+	}
+	f, err := os.OpenFile(outfile_fullname, os.O_CREATE|os.O_WRONLY, 0644)
 	checkErr(err)
-	for _, chunk := range this_file.chunks {
-		ok, err := enc.Verify(chunk.shards)
-		if ok {
-			log.Debugf("Verified chunk no. %d / %d", chunk.chunk_idx, this_file.total_chunks-1)
-		} else {
-			log.Debugf("Verification failed  chunk no. %d / %d. Reconstructing data",
-				chunk.chunk_idx, this_file.total_chunks-1)
-			err = enc.Reconstruct(chunk.shards)
-			if err != nil {
-				checkErr(err)
-			}
-			ok, err = enc.Verify(chunk.shards)
-			if !ok {
-				log.Debugf("Reconstruction failed  chunk no. %d / %d. Reconstructing data",
-					chunk.chunk_idx, this_file.total_chunks-1)
-				checkErr(err)
-			}
-			log.Debugf("Reconstructed! Verified chunk no. %d / %d", chunk.chunk_idx, this_file.total_chunks-1)
-
-		}
-		checkErr(err)
+	defer f.Close()
+	log.Debugf("chunk WriteAt: chunk idx: %d,chunk_data_size: %d, offset: %d, filesize %d",
+		chunk_idx, chunk.chunk_data_size, offset, fs.file_size)
+	bytes_written, err := f.WriteAt(chunk.chunk_buffer[:chunk.chunk_data_size], int64(offset))
+	if err != nil {
+		log.Error("error writing file: ", err)
+		return err
 	}
-}
-
-func (dec *FECFileDecoder) recover_files(out_dir string) {
-
-	for id, file := range dec.all_files {
-		outfile_basename := fmt.Sprintf("%d.out", id)
-		outfile_fullname := filepath.Join(out_dir, outfile_basename)
-		f, err := os.OpenFile(outfile_fullname, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-		checkErr(err)
-		defer f.Close()
-		for _, chunk := range file.chunks {
-			f.Write(chunk.chunk_buffer[:chunk.chunk_data_size])
-		}
-		log.Debugf("Wrote file to %s", outfile_fullname)
+	if bytes_written != chunk.chunk_data_size {
+		err = fmt.Errorf("error writing file %d :  chunk %d wrote %d bytes (expected %d)",
+			fs.file_id, chunk_idx, bytes_written, chunk.chunk_data_size)
+		log.Error(err)
+		return err
 	}
+	chunk.chunk_buffer = nil
+	return nil
 }
 
 func (dec *FECFileDecoder) decode(input_folder string, output_dir string) {
 	dec.all_files = make(map[uint64]*FileStatus)
-	dec.read_chunks(input_folder)
-
-	for k, _ := range dec.all_files {
-		log.Debug("starting reconstruct for file ", k)
-		dec.reconstruct_chunks(k)
-	}
-
-	dec.recover_files(output_dir)
-
+	dec.read_chunks(input_folder, output_dir)
 }
 
 func main() {
@@ -500,10 +568,10 @@ func main() {
 	flag.Parse()
 
 	encoder := newFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
-	decoder := newFECFileDecoder()
-
 	log.Debug("before encode")
 	encoder.encode(*arg_input_file, *arg_enc_out_dir)
+
+	decoder := newFECFileDecoder(int64(*arg_chunk_timeout))
 	log.Debug("before decode")
 	decoder.decode(*arg_enc_out_dir, *arg_dec_out_dir)
 	log.Debug("finish")
