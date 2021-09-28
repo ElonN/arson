@@ -13,16 +13,7 @@ import (
 const (
 	shard_header_size    = 32
 	shard_header_version = 0xA1
-	type_data            = 0xf1
-	type_parity          = 0xf2
 )
-
-func Min(x, y int64) int64 {
-	if x < y {
-		return x
-	}
-	return y
-}
 
 type Chunk struct {
 	chunk_size          int
