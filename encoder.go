@@ -303,7 +303,26 @@ func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id i
 	return chunks, nil
 }
 
-func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string) error {
+func shard_callback(shard []byte, out_file string) error {
+
+	log.Debugf("inside callback is in: %s", out_file)
+	f, err := os.OpenFile(out_file,
+		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+
+	}
+	_, err = f.Write(shard)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return nil
+}
+
+func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string,
+	callback func([]byte, string) error) error {
+
 	log.Debugf("OUTPUT is in: %s.%04d", out_base, 1)
 
 	// Make channels to pass fatal errors in WaitGroup
@@ -319,28 +338,16 @@ func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string) error {
 			log.Debug("Inside sending goroutine number ", i)
 
 			for j := 0; j < enc.total_shards; j++ {
-				f, err := os.OpenFile(fmt.Sprintf("%s.%04d.%04d", out_base, i, j),
-					os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-				if err != nil {
-					fatalErrors <- err
-					return
-				}
 				var header [shard_header_size]byte
 				enc.mark_shard_header(header[:], &c, j)
-				bytes_written, err := f.Write(header[:])
+				full_shard := make([]byte, shard_header_size+len(c.shards[j]))
+				copy(full_shard[:shard_header_size], header[:])
+				copy(full_shard[shard_header_size:], c.shards[j])
+				//fatalErrors <-
+				err := callback(full_shard, fmt.Sprintf("%s.%04d.%04d", out_base, i, j))
 				if err != nil {
 					fatalErrors <- err
 				}
-				if bytes_written != shard_header_size {
-					fatalErrors <- fmt.Errorf("get_chunks: shard %d at chunk %d read %d bytes (expected %d)",
-						j, i, bytes_written, shard_header_size)
-				}
-
-				f.Write(c.shards[j])
-				if err != nil {
-					fatalErrors <- err
-				}
-				f.Close()
 			}
 
 			log.Debug("Finished sending goroutine number ", i)
@@ -371,7 +378,7 @@ func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 	chunks, err := enc.get_chunks(filename, enc.max_chunk_size, int(enc.idGen.Generate()))
 	checkErr(err)
 
-	err = enc.send_chunks(chunks, filepath.Join(out_dir, filepath.Base(filename)))
+	err = enc.send_chunks(chunks, filepath.Join(out_dir, filepath.Base(filename)), shard_callback)
 	checkErr(err)
 
 	log.Debug("Finished")
