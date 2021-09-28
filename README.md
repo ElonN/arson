@@ -31,5 +31,21 @@ The shards can be emitted in the following ways:
 
 Common use-case is streaming shards over the network. For this case, shard size should be approximately MTU size.
 
+## Code snippet
+
+On sender side -
+```go
+
+encoder := arson.NewFECFileEncoder(num_data_shards, num_parity_shards, max_shard_size)
+var writer io.Writer = stream_to_output
+encoder.EncodeToStream(input_filepath, stream_to_output)
+``` 
+On receiver side -
+```go
+decoder := arson.NewFECFileDecoder(chunk_timeout, out_dir)
+var reader io.Reader = input_stream
+decoder.Decode(input_stream)
+```
+
 ## Links
 https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
