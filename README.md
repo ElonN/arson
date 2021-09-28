@@ -22,7 +22,7 @@ From Klaus' documentation about shortcomings of his [simple encoder/decoder](htt
 This package takes large files, splits it to chunks with adjustable size, and applys reed-solomon encoding for each chunk.
 Additionally it adds a header to each shard tracking important info such as file id, sizes, chunk index and shard index.
 This header makes it possible to deduce all required information for reconstruction from the content of the shards only.
-That means user can ignore ordering, file names, etc. - just bring enough shards to the decoder.
+That means user can ignore ordering, file names, etc. - just transfer enough shards to the decoder.
 The shards can be streamed to io.writer, written to output dir or returned in-memory.
 Common use-case is streaming shards over the network - thus shard size should be approx. MTU
 
