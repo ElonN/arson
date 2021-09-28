@@ -31,12 +31,11 @@
 // If you save these properties, you should abe able to detect file corruption
 // in a shard and be able to reconstruct your data if you have the needed number of shards left.
 
-package main
+package arson
 
 import (
 	"bufio"
 	"encoding/binary"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -57,35 +56,6 @@ const (
 	type_data            = 0xf1
 	type_parity          = 0xf2
 )
-
-var (
-	arg_num_data_shards   = flag.Int("ds", 10, "Number of data shards")
-	arg_num_parity_shards = flag.Int("ps", 3, "Number of parity shards")
-	arg_full_shard_size   = flag.Int("mss", 1300, "Maximum segment size to send (shard + header)")
-	arg_chunk_timeout     = flag.Int("to", 60, "Timeout for receiving chunks (in seconds)")
-	arg_input_file        = flag.String("f", "", "Input file")
-	arg_enc_out_dir       = flag.String("eout", "", "Encoder output directory")
-	arg_enc_out_file      = flag.String("eoutfile", "", "Encoder output file")
-	arg_dec_out_dir       = flag.String("dout", "", "Decoder output directory")
-)
-
-func init() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  simple-encoder [-flags] filename.ext\n\n")
-		fmt.Fprintf(os.Stderr, "Valid flags:\n")
-		flag.PrintDefaults()
-	}
-	// Log as JSON instead of the default ASCII formatter.
-	// log.SetFormatter(&log.JSONFormatter{})
-
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
-	log.SetOutput(os.Stdout)
-
-	// Only log the warning severity or above.
-	log.SetLevel(log.DebugLevel)
-}
 
 type Chunk struct {
 	chunk_size          int
@@ -232,28 +202,54 @@ func Min(x, y int64) int64 {
 	return y
 }
 
-func send_chunks_to_io(writer *bufio.Writer, cin chan *Chunk,
+func (chunk *Chunk) write_shard(idx int, writer io.Writer) error {
+	b := chunk.shard_header
+	b[1] = byte(idx) // fill shard_idx in shard header
+	_, err := writer.Write(b[:])
+	if err != nil {
+		return err
+	}
+	_, err = writer.Write(chunk.shards[idx])
+	if err != nil {
+		return err
+	}
+	log.Debugf("Finished writing chunk.shard %d.%d", chunk.chunk_idx, idx)
+	return nil
+}
+
+func (chunk *Chunk) write_shards_to_folder(folder string) error {
+	log.Debugf("write_shards_to_folder chunk %d", chunk.chunk_idx)
+	for j := 0; j < chunk.num_total_shards; j++ {
+		out_pattern := fmt.Sprintf("%d.%04d.%04d", chunk.file_id, chunk.chunk_idx, j)
+		out_file := filepath.Join(folder, out_pattern)
+		f, err := os.OpenFile(out_file, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		err = chunk.write_shard(j, f)
+		if err != nil {
+			return err
+		}
+	}
+	chunk.free()
+	return nil
+}
+
+func send_chunks_to_io(writer io.Writer, cin chan *Chunk,
 	done chan bool, fatal_errors chan error) {
 	log.Debug("Starting to send chunks - listening on channel")
 	for chunk := range cin {
 		log.Debugf("send_chunks_to_io received chunk %d from channel", chunk.chunk_idx)
 		for j := 0; j < chunk.num_total_shards; j++ {
-			b := chunk.shard_header
-			b[1] = byte(j) // fill shard_idx in shard header
-			_, err := writer.Write(b[:])
+			err := chunk.write_shard(j, writer)
 			if err != nil {
 				fatal_errors <- err
 			}
-			_, err = writer.Write(chunk.shards[j])
-			if err != nil {
-				fatal_errors <- err
-			}
-			log.Debugf("Finished writing chunk.shard %d.%d", chunk.chunk_idx, j)
 		}
 		chunk.free()
 	}
 	log.Debug("Finished sending chunks - channel closed")
-	writer.Flush()
 	done <- true
 }
 
@@ -268,14 +264,29 @@ func (enc *FECFileEncoder) get_all_shards() [][]byte {
 }
 
 func (enc *FECFileEncoder) Encode(filename string) ([][]byte, error) {
-	err := enc.EncodeStream(filename, nil)
+	err := enc.encode_internal(filename, "", nil)
 	if err != nil {
 		return nil, err
 	}
 	return enc.get_all_shards(), nil
 }
 
-func (enc *FECFileEncoder) EncodeStream(filename string, writer *bufio.Writer) error {
+func (enc *FECFileEncoder) EncodeToFolder(filename string, output_dir string) error {
+	err := enc.encode_internal(filename, output_dir, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (enc *FECFileEncoder) EncodeToStream(filename string, writer io.Writer) error {
+	if writer == nil {
+		return fmt.Errorf("EncodeToStream: entered nil writer")
+	}
+	return enc.encode_internal(filename, "", writer)
+}
+
+func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer io.Writer) error {
 	file_id := uint64(enc.idGen.Generate())
 	log.Debug("Opening ", filename)
 	file, err := os.Open(filename)
@@ -378,6 +389,8 @@ func (enc *FECFileEncoder) EncodeStream(filename string, writer *bufio.Writer) e
 			// writer is nil when caller wants all shards in memory
 			if writer != nil {
 				chunk_channel <- chunk
+			} else if output_dir != "" {
+				chunk.write_shards_to_folder(output_dir)
 			}
 
 		}(this_chunk)
@@ -385,7 +398,6 @@ func (enc *FECFileEncoder) EncodeStream(filename string, writer *bufio.Writer) e
 	// writer is nil when caller wants all shards in memory
 	if writer != nil {
 		go send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
-
 	}
 
 	// Important final goroutine to wait until WaitGroup is done
@@ -619,7 +631,7 @@ func (dec *FECFileDecoder) decode_from_file(filename string) error {
 	return nil
 }
 
-func (dec *FECFileDecoder) decode_from_folder(input_folder string) error {
+func (dec *FECFileDecoder) DecodeFromFolder(input_folder string) error {
 	files, err := ioutil.ReadDir(input_folder)
 	if err != nil {
 		return err
@@ -665,38 +677,4 @@ func (fs *FileStatus) write_chunk(chunk_idx int) error {
 	}
 	chunk.chunk_buffer = nil
 	return nil
-}
-
-func main() {
-	// Parse command line parameters.
-	flag.Parse()
-
-	out_file_encoder, err := os.OpenFile(*arg_enc_out_file,
-		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Error(err)
-		return
-	}
-
-	buffered_writer := bufio.NewWriter(out_file_encoder)
-
-	encoder := NewFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
-	log.Debug("before encode")
-	encoder.EncodeStream(*arg_input_file, buffered_writer)
-	out_file_encoder.Close()
-
-	log.Debug("before decode")
-	decoder := NewFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
-	filename := *arg_enc_out_file
-	log.Debug("Opening ", filename)
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Error(err)
-		return
-	}
-	defer file.Close()
-
-	buffered_reader := bufio.NewReader(file)
-	decoder.Decode(buffered_reader)
-	log.Debug("exiting main")
 }
