@@ -23,8 +23,13 @@ This package takes large files, splits it to chunks with adjustable size, and ap
 Additionally it adds a header to each shard tracking important info such as file id, sizes, chunk index and shard index.
 This header makes it possible to deduce all required information for reconstruction from the content of the shards only.
 That means user can ignore ordering, file names, etc. - just transfer enough shards to the decoder.
-The shards can be streamed to io.writer, written to output dir or returned in-memory.
-Common use-case is streaming shards over the network - thus shard size should be approx. MTU
+
+The shards can be emitted in the following ways:
+* Streamed to given io.writer
+* Written to output directory
+* Returned in-memory (not recommended for large files)
+
+Common use-case is streaming shards over the network - thus shard size should be approximately MTU size.
 
 ## Links
 https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
