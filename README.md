@@ -31,7 +31,7 @@ The shards can be emitted in the following ways:
 
 Common use-case is streaming shards over the network. For this case, shard size should be approximately MTU size.
 
-## Code snippet
+## Code Snippet
 
 On sender side -
 ```go
