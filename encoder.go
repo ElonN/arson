@@ -598,33 +598,36 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 
 }
 
-func (dec *FECFileDecoder) read_shards(r *bufio.Reader) error {
+func (dec *FECFileDecoder) Decode(r io.Reader) error {
+	b := make([]byte, shard_header_size)
 	for {
-		ver, err := r.Peek(1)
+		_, err := io.ReadFull(r, b[:1])
 		if err != nil {
 			if err == io.EOF {
-				log.Debug("read_shards: reached EOF")
+				log.Debug("Decode: reached EOF")
 				return nil
 			}
 			return err
 		}
-		if ver[0] != shard_header_version {
+		if b[0] != shard_header_version {
 			err = fmt.Errorf("unknown shard header version")
 			log.Error(err)
 			return err
 		}
-		header, err := r.Peek(shard_header_size)
+		num_read, err := io.ReadFull(r, b[1:shard_header_size])
 		if err != nil {
+			log.Errorf("Decode : ReadFull - header read is %d / %d", num_read, shard_header_size-1)
 			return err
 		}
-		shard_size := binary.LittleEndian.Uint32(header[4:])
+		shard_size := binary.LittleEndian.Uint32(b[4:])
 		shard_buf := make([]byte, shard_header_size+shard_size)
-		num_read, err := io.ReadFull(r, shard_buf)
+		copy(shard_buf[:shard_header_size], b)
+		num_read, err = io.ReadFull(r, shard_buf[shard_header_size:])
 		if err != nil {
-			log.Errorf("read_shards : ReadFull - num read is %d / %d", num_read, shard_header_size+shard_size)
+			log.Errorf("Decode : ReadFull - shard read is %d / %d", num_read, shard_size)
 			return err
 		}
-		log.Debug("read_shards: putting shard")
+		log.Debug("Decode: putting shard")
 		dec.put_shard(shard_buf)
 	}
 }
@@ -640,7 +643,7 @@ func (dec *FECFileDecoder) decode_from_file(filename string) error {
 	// first - sequentially reads chunks form file
 	// then - spawns goroutines and encodes chunks concurrently
 	buffered_reader := bufio.NewReader(file)
-	dec.read_shards(buffered_reader)
+	dec.Decode(buffered_reader)
 	return nil
 }
 
