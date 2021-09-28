@@ -43,7 +43,7 @@ func NewFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 	return enc
 }
 
-func send_chunks_to_io(writer io.Writer, cin chan *Chunk,
+func (enc *FECFileEncoder) send_chunks_to_io(writer io.Writer, cin chan *Chunk,
 	done chan bool, fatal_errors chan error) {
 	log.Debug("Starting to send chunks - listening on channel")
 	for chunk := range cin {
@@ -204,7 +204,7 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 	}
 	// writer is nil when caller wants all shards in memory
 	if writer != nil {
-		go send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
+		go enc.send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
 	}
 
 	// Important final goroutine to wait until WaitGroup is done
