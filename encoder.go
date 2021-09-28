@@ -21,23 +21,20 @@ type FECFileEncoder struct {
 	full_shard_size    int
 	shard_data_size    int
 	total_chunk_buffer int
-	type_data          byte
-	type_parity        byte
 	max_chunk_size     int
 	idGen              *snowflake.Node
 	chunks             []Chunk
 }
 
-func NewFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFileEncoder {
+// Returns a new File FEC Encoder. This
+func NewFECFileEncoder(data_shards, parity_shards, max_shard_size int) *FECFileEncoder {
 	enc := new(FECFileEncoder)
 	enc.num_data_shards = data_shards
 	enc.num_parity_shards = parity_shards
 	enc.num_total_shards = data_shards + parity_shards
-	enc.full_shard_size = full_shard_size
-	enc.shard_data_size = full_shard_size - shard_header_size
+	enc.full_shard_size = max_shard_size
+	enc.shard_data_size = max_shard_size - shard_header_size
 	enc.total_chunk_buffer = enc.num_total_shards * enc.shard_data_size
-	enc.type_data = 0xf1
-	enc.type_parity = 0xf2
 	enc.max_chunk_size = enc.shard_data_size * int(enc.num_data_shards)
 	enc.idGen, _ = snowflake.NewNode(1)
 	return enc
@@ -70,6 +67,11 @@ func (enc *FECFileEncoder) get_all_shards() [][]byte {
 	return all_shards
 }
 
+// Encodes file <filename> and returns slice that has all shards
+// The resulting shards will be at most max_shard_size and will
+// have all data needed for reconstruction  embeded in their content.
+// all shards will remain in memory so for large file consider using
+// other methods - EncodeToStream or EncodeToFolder
 func (enc *FECFileEncoder) Encode(filename string) ([][]byte, error) {
 	err := enc.encode_internal(filename, "", nil)
 	if err != nil {
@@ -78,6 +80,12 @@ func (enc *FECFileEncoder) Encode(filename string) ([][]byte, error) {
 	return enc.get_all_shards(), nil
 }
 
+// Encodes file <filename> and saves it's shards to output_dir
+// The resulting shards will be at most max_shard_size and will
+// have all data needed for reconstruction  embeded in their content.
+// i.e their filenames are not necesarry and can be changed.
+// File will be read chunk by chunk so that even large files will
+// have reasonable memory consumption
 func (enc *FECFileEncoder) EncodeToFolder(filename string, output_dir string) error {
 	err := enc.encode_internal(filename, output_dir, nil)
 	if err != nil {
@@ -86,6 +94,11 @@ func (enc *FECFileEncoder) EncodeToFolder(filename string, output_dir string) er
 	return nil
 }
 
+// Encodes file <filename> to shards and streams them to io.writer.
+// The resulting shards will be at most max_shard_size and will
+// have all data needed for reconstruction  embeded in their content.
+// File will be read chunk by chunk so that even large files will
+// have reasonable memory consumption
 func (enc *FECFileEncoder) EncodeToStream(filename string, writer io.Writer) error {
 	if writer == nil {
 		return fmt.Errorf("EncodeToStream: entered nil writer")
@@ -111,13 +124,18 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 	filesize := fileinfo.Size()
 	log.Debug("File size of ", filename, " is ", filesize)
 	log.Debug("Chunk size is ", chunk_size)
-	// Number of go routines we need to spawn.
+
+	// total_chunks is simply the file size divided by chunk size
 	enc.total_chunks = int(math.Ceil(float64(filesize) / float64(chunk_size)))
 	total_chunks := enc.total_chunks
 	log.Debug("num_chunks is ", total_chunks)
+
+	// chunks are saved in the encoder context
 	enc.chunks = make([]Chunk, total_chunks)
 	chunks := enc.chunks
 
+	// each chunk should be rather independent from encoder context, so we will
+	// initialize all relevent data to chunk attributes
 	for i := 0; i < total_chunks; i++ {
 		chunks[i].chunk_size = chunk_size
 		chunks[i].chunk_idx = i
@@ -137,17 +155,17 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 		}
 	}
 
-	// Make channels to pass fatal errors in WaitGroup
+	// make channels to communicate workers
 	fatal_errors := make(chan error)
-	wgDone := make(chan bool)
 	chunk_channel := make(chan *Chunk)
 	write_done_channel := make(chan bool)
+	wg_done := make(chan bool)
 
 	var wg sync.WaitGroup
 	wg.Add(total_chunks)
 
 	// start buffered read
-	// first - sequentially reads chunks form file
+	// first - sequentially reads chunks from file
 	// then - spawns goroutines and encodes chunks concurrently
 	buffered_reader := bufio.NewReaderSize(file, chunk_size)
 
@@ -162,6 +180,7 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 		if i == total_chunks-1 {
 			// last chunk has partial data
 			// for last chunk:  chunk_size = last_chunk_data + zero_padding
+			// hence size to read is the following -
 			size_to_read = this_chunk.chunk_size - this_chunk.zero_padding_length
 		}
 		bytes_read, err := io.ReadFull(buffered_reader, this_chunk.chunk_buffer[:size_to_read])
@@ -175,7 +194,7 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 			defer wg.Done()
 			log.Debug("Inside chunk goroutine number ", chunk.chunk_idx)
 
-			// "shards" are slices from chunk_buffer
+			// "shards" are just slices from chunk_buffer
 			chunk.shards = make([][]byte, enc.num_total_shards)
 			for j := 0; j < enc.num_total_shards; j++ {
 				idx_start := enc.shard_data_size * j
@@ -183,7 +202,7 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 				chunk.shards[j] = chunk.chunk_buffer[idx_start:idx_end]
 			}
 
-			// Create encoding matrix
+			// create encoding matrix
 			encoder, err := reedsolomon.New(enc.num_data_shards, enc.num_parity_shards)
 			if err != nil {
 				fatal_errors <- err
@@ -193,37 +212,39 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 			if err != nil {
 				fatal_errors <- err
 			}
-			// writer is nil when caller wants all shards in memory
+			// writer is nil when caller wants all shards in memory and not to use streaming
 			if writer != nil {
+				// send chunk to io worker goroutine
 				chunk_channel <- chunk
 			} else if output_dir != "" {
 				chunk.write_shards_to_folder(output_dir)
-			}
+			} // else: shards will remain in memory
 
 		}(this_chunk)
 	}
 	// writer is nil when caller wants all shards in memory
 	if writer != nil {
+		// spawn io worker goroutine
 		go enc.send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
 	}
 
-	// Important final goroutine to wait until WaitGroup is done
+	// final goroutine to wait until WaitGroup is done
 	go func() {
 		wg.Wait()
-		close(wgDone)
+		close(wg_done)
 	}()
 
 	// Wait until either WaitGroup is done or an error is received through the channel
 	select {
-	case <-wgDone:
+	case <-wg_done:
 		// carry on
 		log.Debug("waitgroup finished")
 		if writer == nil { // writer is nil when caller wants all shards in memory
 			// we got all shards in memory, now return
 			return nil
 		}
-		// if we have a writer, we need to wait for it to finish
-		// first, signal the writer goroutine that no more chunks are left
+		// if we have an io worker, we need to wait for it to finish
+		// first, signal the  io worker goroutine that no more chunks are left
 		close(chunk_channel)
 		break
 	case err := <-fatal_errors:
@@ -232,7 +253,7 @@ func (enc *FECFileEncoder) encode_internal(filename, output_dir string, writer i
 		return err
 	}
 
-	// wait for writer goroutine
+	// now wait for writer goroutine to finish
 	select {
 	case <-write_done_channel: // write goroutine finished
 		log.Debug("got finish signal from writing routine")

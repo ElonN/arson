@@ -37,14 +37,17 @@ type FECFileDecoder struct {
 	output_folder string
 }
 
-// Returns a new file decoder. Each decoder instance has its own context and should
-// not be used concurrently.
-// Decoder can listen on a reader stream. Every new completed file is recontructed
-// and written to output folder with the name <id>.out where <id> is int64 decided by
-// the encoder.
-// Every file sent has it's data reconstructed (if possible) but metadata is lost.
+// Returns a new file decoder.
+// Decoder can listen for shards on a reader stream or read shards from a folder.
+// Every new completed file is recontructed and written to output folder with the
+// name <id>.out where <id> is a int64 file identifier decided by the encoder.
+// The shards built by the encoder have all data needed to be reconstructed,
+// including order indexes, sizes and file identifiers, so just feed these shards
+// to the decoder without putting effort in ordering them in any way.
+// Every file sent will have it's data reconstructed (if possible) but metadata is lost.
 // That means that if file name or permissions need to be perserved, one should
 // embed them in file data.
+// Each decoder instance has its own context and should not be used concurrently.
 // chunk_timeout is the amount of time that a uncompleted chunk can accept new shards.
 func NewFECFileDecoder(chunk_timeout int64, output_folder string) *FECFileDecoder {
 	dec := new(FECFileDecoder)
@@ -225,6 +228,8 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 
 }
 
+// Listens for shards on io.reader
+// Iterates the stream, reads shards and recontruct files if possible
 func (dec *FECFileDecoder) Decode(r io.Reader) error {
 	b := make([]byte, shard_header_size)
 	for {
@@ -271,6 +276,7 @@ func (dec *FECFileDecoder) decode_from_file(filename string) error {
 	return nil
 }
 
+// Reads all shards from input_folder and recontruct files if possible
 func (dec *FECFileDecoder) DecodeFromFolder(input_folder string) error {
 	files, err := ioutil.ReadDir(input_folder)
 	if err != nil {
