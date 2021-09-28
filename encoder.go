@@ -139,7 +139,7 @@ type FECFileEncoder struct {
 	chunks             []Chunk
 }
 
-func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFileEncoder {
+func NewFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFileEncoder {
 	enc := new(FECFileEncoder)
 	enc.num_data_shards = data_shards
 	enc.num_parity_shards = parity_shards
@@ -160,7 +160,7 @@ type FECFileDecoder struct {
 	output_folder string
 }
 
-func newFECFileDecoder(chunk_timeout int64, output_folder string) *FECFileDecoder {
+func NewFECFileDecoder(chunk_timeout int64, output_folder string) *FECFileDecoder {
 	dec := new(FECFileDecoder)
 	dec.all_files = make(map[uint64]*FileStatus)
 	dec.chunk_timeout = chunk_timeout
@@ -683,12 +683,12 @@ func main() {
 
 	buffered_writer := bufio.NewWriter(out_file_encoder)
 
-	encoder := newFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
+	encoder := NewFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
 	log.Debug("before encode")
 	encoder.EncodeStream(*arg_input_file, buffered_writer)
 	out_file_encoder.Close()
 
-	decoder := newFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
+	decoder := NewFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
 	log.Debug("before decode")
 	//decoder.decode_from_folder(*arg_enc_out_dir)
 	decoder.decode_from_file(*arg_enc_out_file)
