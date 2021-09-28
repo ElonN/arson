@@ -29,7 +29,7 @@ The shards can be emitted in the following ways:
 * Written to output directory
 * Returned in-memory (not recommended for large files)
 
-Common use-case is streaming shards over the network - thus shard size should be approximately MTU size.
+Common use-case is streaming shards over the network. For this case, shard size should be approximately MTU size.
 
 ## Links
 https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
