@@ -34,9 +34,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"os"
@@ -50,9 +52,10 @@ import (
 )
 
 const (
-	shard_header_size = 32
-	type_data         = 0xf1
-	type_parity       = 0xf2
+	shard_header_size    = 32
+	shard_header_version = 0xA1
+	type_data            = 0xf1
+	type_parity          = 0xf2
 )
 
 var (
@@ -84,10 +87,10 @@ func init() {
 }
 
 type Chunk struct {
-	chunk_data_size     int
+	chunk_size          int
 	chunk_idx           int
-	file_id             int
-	file_size           int
+	file_id             uint64
+	file_size           int64
 	total_chunks        int
 	shards              [][]byte
 	chunk_buffer        []byte
@@ -95,22 +98,30 @@ type Chunk struct {
 	arrived_shards      int
 	arrived_data_shards int
 	timestamp           int64
+	num_data_shards     int
+	num_parity_shards   int
+	shard_data_size     int
+	zero_padding_length int
+	shard_header        [shard_header_size]byte
 }
 
 type FileStatus struct {
-	file_id           uint64
-	file_size         uint64
-	total_chunks      int
-	arrived_chunks    int
-	finished_chunks   int
-	num_data_shards   byte
-	num_parity_shards byte
-	num_total_shards  byte
-	shard_data_size   int
-	is_finished       bool
-	is_failed         bool
-	timestamp         int64
-	chunks            []Chunk
+	file_id             uint64
+	file_size           int64
+	total_chunks        int
+	arrived_chunks      int
+	finished_chunks     int
+	num_data_shards     int
+	num_parity_shards   int
+	num_total_shards    int
+	shard_data_size     int
+	chunk_size          int
+	zero_padding_length int
+	is_finished         bool
+	is_failed           bool
+	timestamp           int64
+	output_folder       string
+	chunks              []Chunk
 }
 
 type FECFileEncoder struct {
@@ -136,7 +147,7 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 	enc.total_chunk_buffer = enc.total_shards * enc.shard_data_size
 	enc.type_data = 0xf1
 	enc.type_parity = 0xf2
-	enc.max_chunk_size = enc.shard_data_size * enc.num_data_shards
+	enc.max_chunk_size = enc.shard_data_size * int(enc.num_data_shards)
 	enc.idGen, _ = snowflake.NewNode(1)
 	return enc
 }
@@ -144,53 +155,69 @@ func newFECFileEncoder(data_shards, parity_shards, full_shard_size int) *FECFile
 type FECFileDecoder struct {
 	all_files     map[uint64]*FileStatus
 	chunk_timeout int64
+	output_folder string
 }
 
-func newFECFileDecoder(chunk_timeout int64) *FECFileDecoder {
+func newFECFileDecoder(chunk_timeout int64, output_folder string) *FECFileDecoder {
 	dec := new(FECFileDecoder)
+	dec.all_files = make(map[uint64]*FileStatus)
 	dec.chunk_timeout = chunk_timeout
+	dec.output_folder = output_folder
 	return dec
 }
 
-func parse_shard_header(b []byte) (file_id uint64, file_size uint64, chunk_idx uint32,
-	total_chunks uint32, chunk_data_size uint32, shard_idx uint16, num_data_shards byte,
-	num_parity_shards byte) {
+func parse_shard_header(b []byte) (file_id uint64, chunk_idx uint32, total_chunks uint32,
+	chunk_size uint32, shard_idx byte, num_data_shards byte, num_parity_shards byte,
+	shard_header_version byte, shard_data_size uint32, zero_padding_length uint32) {
 	//
 	//The header format:
-	// |                      file_id(8B)                         |
-	// |                      file_size(8B)                       |
-	// |      chunk_idx (4B)          |       total_chunks(4B)    |
-	// |	  chunk_data_size(4B)	  |shard_idx(2B)|DS(1B)|PS(1B)|
+	// |version(1B)|shard_idx(1B)|DS(1B)|PS(1B)|		 shard_data_size (4B) 		   |
+	// |                      				file_id(8B)     						   |
+	// |          chunk_idx (4B)         	   |       	total_chunks(4B)        	   |
+	// |	 	 chunk_size(4B)		           |	 	zero_padding_length(4B)		   |
 	//
 	//
-	file_id = binary.LittleEndian.Uint64(b)
-	file_size = binary.LittleEndian.Uint64(b[8:])
+	shard_header_version = b[0]
+	shard_idx = b[1]
+	num_data_shards = b[2]
+	num_parity_shards = b[3]
+	shard_data_size = binary.LittleEndian.Uint32(b[4:])
+	file_id = binary.LittleEndian.Uint64(b[8:])
 	chunk_idx = binary.LittleEndian.Uint32(b[16:])
 	total_chunks = binary.LittleEndian.Uint32(b[20:])
-	chunk_data_size = binary.LittleEndian.Uint32(b[24:])
-	shard_idx = binary.LittleEndian.Uint16(b[28:])
-	num_data_shards = byte(b[30])
-	num_parity_shards = byte(b[31])
+	chunk_size = binary.LittleEndian.Uint32(b[24:])
+	zero_padding_length = binary.LittleEndian.Uint32(b[28:])
 	return
 }
 
-func (enc *FECFileEncoder) mark_shard_header(b []byte, c *Chunk, idx int) {
+func (chunk *Chunk) fill_shard_header() error {
 	//
 	//The header format:
-	// |                      file_id(8B)                         |
-	// |                      file_size(8B)                       |
-	// |      chunk_idx (4B)          |       total_chunks(4B)    |
-	// |	  chunk_data_size(4B)	  |shard_idx(2B)|DS(1B)|PS(1B)|
+	// |version(1B)|shard_idx(1B)|DS(1B)|PS(1B)|		 shard_data_size (4B) 		   |
+	// |                      				file_id(8B)     						   |
+	// |          chunk_idx (4B)         	   |       	total_chunks(4B)        	   |
+	// |	 	 chunk_size(4B)		           |	 	zero_padding_length(4B)		   |
 	//
 	//
-	binary.LittleEndian.PutUint64(b, uint64(c.file_id))
-	binary.LittleEndian.PutUint64(b[8:], uint64(c.file_size))
-	binary.LittleEndian.PutUint32(b[16:], uint32(c.chunk_idx))
-	binary.LittleEndian.PutUint32(b[20:], uint32(c.total_chunks))
-	binary.LittleEndian.PutUint32(b[24:], uint32(c.chunk_data_size))
-	binary.LittleEndian.PutUint16(b[28:], uint16(idx))
-	b[30] = uint8(*arg_num_data_shards)
-	b[31] = uint8(*arg_num_parity_shards)
+	if chunk.file_id == 0 || chunk.total_chunks == 0 || chunk.chunk_size == 0 ||
+		chunk.num_data_shards == 0 {
+		log.Errorf("fill_shard_header: file_id %d, file_size %d, chunk_idx %d, total_chunks %d, chunk_size %d, num_data_shards %d, num_parity_shards %d",
+			chunk.file_id, chunk.file_size, chunk.chunk_idx, chunk.total_chunks, chunk.chunk_size,
+			chunk.num_data_shards, chunk.num_parity_shards)
+		return fmt.Errorf("tried to call mark_shard_header for an unintialized chunk")
+	}
+	b := chunk.shard_header[:]
+	b[0] = byte(shard_header_version)
+	// b[1] is shard_idx which we build dynamically
+	b[2] = byte(chunk.num_data_shards)
+	b[3] = byte(chunk.num_parity_shards)
+	binary.LittleEndian.PutUint32(b[4:], uint32(chunk.shard_data_size))
+	binary.LittleEndian.PutUint64(b[8:], uint64(chunk.file_id))
+	binary.LittleEndian.PutUint32(b[16:], uint32(chunk.chunk_idx))
+	binary.LittleEndian.PutUint32(b[20:], uint32(chunk.total_chunks))
+	binary.LittleEndian.PutUint32(b[24:], uint32(chunk.chunk_size))
+	binary.LittleEndian.PutUint32(b[28:], uint32(chunk.zero_padding_length))
+	return nil
 }
 
 func Min(x, y int64) int64 {
@@ -200,17 +227,18 @@ func Min(x, y int64) int64 {
 	return y
 }
 
-func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id int) ([]Chunk, error) {
+func (enc *FECFileEncoder) encode_chunks(filename string, chunk_size int, out_base string) error {
+	file_id := uint64(enc.idGen.Generate())
 	log.Debug("Opening ", filename)
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
 	fileinfo, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	filesize := fileinfo.Size()
@@ -222,15 +250,22 @@ func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id i
 	chunks := make([]Chunk, num_chunks)
 
 	for i := 0; i < num_chunks; i++ {
-		chunks[i].chunk_data_size = chunk_size
+		chunks[i].chunk_size = chunk_size
 		chunks[i].chunk_idx = i
 		chunks[i].file_id = file_id
 		chunks[i].total_chunks = num_chunks
-		chunks[i].file_size = int(filesize)
+		chunks[i].file_size = filesize
 		chunks[i].chunk_buffer = make([]byte, enc.total_shards*enc.shard_data_size)
+		chunks[i].num_data_shards = enc.num_data_shards
+		chunks[i].num_parity_shards = enc.num_parity_shards
+		chunks[i].shard_data_size = enc.shard_data_size
+		chunks[i].zero_padding_length = num_chunks*chunk_size - int(filesize)
+
+		err = chunks[i].fill_shard_header()
+		if err != nil {
+			return err
+		}
 	}
-	// last one is the remainder
-	chunks[num_chunks-1].chunk_data_size = int(filesize) - chunks[num_chunks-1].chunk_idx*chunk_size
 
 	// Make channels to pass fatal errors in WaitGroup
 	fatalErrors := make(chan error)
@@ -239,50 +274,62 @@ func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id i
 	var wg sync.WaitGroup
 	wg.Add(num_chunks)
 
+	// start buffered read
+	// first - sequentially reads chunks form file
+	// then - spawns goroutines and encodes chunks concurrently
+	buffered_reader := bufio.NewReaderSize(file, chunk_size)
+
 	log.Debug("Starting chunk goroutines")
 	for i := 0; i < num_chunks; i++ {
-		// Each of these go routines will fill shards for a chunk
-		go func(chunksizes []Chunk, i int) {
+		this_chunk := &chunks[i]
+
+		//				 |------DATA SHARDS-----------| |----PARITY SHARDS-----|
+		// chunk_buffer = data_from_file + zero_padding + space_for_parity_shards
+
+		size_to_read := this_chunk.chunk_size
+		if i == num_chunks-1 {
+			// last chunk has partial data
+			// for last chunk:  chunk_size = last_chunk_data + zero_padding
+			size_to_read = this_chunk.chunk_size - this_chunk.zero_padding_length
+		}
+		bytes_read, err := io.ReadFull(buffered_reader, this_chunk.chunk_buffer[:size_to_read])
+		if err != nil {
+			return err
+		}
+		log.Debug("Read ", bytes_read, " / ", size_to_read, " bytes for chunk ", i)
+
+		// Each of these go routines will encode a chunk and create the parity shards
+		go func(chunk *Chunk) {
 			defer wg.Done()
-			log.Debug("Inside chunk goroutine number ", i)
-			this_chunk := &chunksizes[i]
-
-			//				 |------DATA SHARDS-----------| |----PARITY SHARDS-----|
-			// chunk_buffer = data_from_file + zero_padding + space_for_parity_shards
-			//				 |chunk_data_size|
-
-			data_from_file := this_chunk.chunk_buffer[:this_chunk.chunk_data_size]
-			bytes_read, err := file.ReadAt(data_from_file, int64(this_chunk.chunk_idx)*int64(chunk_size))
-
-			log.Debug("Read ", bytes_read, " / ", this_chunk.chunk_data_size, " bytes for chunk ", i)
-
-			if bytes_read != this_chunk.chunk_data_size {
-				fatalErrors <- fmt.Errorf("get_chunks: chunk %d at index %d read %d bytes (expected %d)",
-					i, this_chunk.chunk_idx, bytes_read, this_chunk.chunk_data_size)
-			}
-			if err != nil {
-				fatalErrors <- err
-			}
+			log.Debug("Inside chunk goroutine number ", chunk.chunk_idx)
 
 			// "shards" are slices from chunk_buffer
-			this_chunk.shards = make([][]byte, enc.total_shards)
+			chunk.shards = make([][]byte, enc.total_shards)
 			for j := 0; j < enc.total_shards; j++ {
 				idx_start := enc.shard_data_size * j
 				idx_end := idx_start + enc.shard_data_size
-				this_chunk.shards[j] = this_chunk.chunk_buffer[idx_start:idx_end]
+				chunk.shards[j] = chunk.chunk_buffer[idx_start:idx_end]
 			}
 
-			// Create encoding matrix.
-			enc, err := reedsolomon.New(enc.num_data_shards, enc.num_parity_shards)
+			// Create encoding matrix
+			encoder, err := reedsolomon.New(enc.num_data_shards, enc.num_parity_shards)
 			if err != nil {
 				fatalErrors <- err
 			}
-
-			err = enc.Encode(this_chunk.shards)
+			// perform the encode - create parity shards
+			err = encoder.Encode(chunk.shards)
 			if err != nil {
 				fatalErrors <- err
 			}
-		}(chunks, i)
+			out_file_chunk, err := os.OpenFile(fmt.Sprintf("%s.%04d", out_base, chunk.chunk_idx),
+				os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				fatalErrors <- err
+			}
+			defer out_file_chunk.Close()
+			buffered_writer := bufio.NewWriterSize(out_file_chunk, enc.full_shard_size)
+			enc.handle_shards(chunk, buffered_writer)
+		}(this_chunk)
 	}
 
 	// Important final goroutine to wait until WaitGroup is done
@@ -298,11 +345,12 @@ func (enc *FECFileEncoder) get_chunks(filename string, chunk_size int, file_id i
 		break
 	case err := <-fatalErrors:
 		wg.Wait()
-		return nil, err
+		return err
 	}
-	return chunks, nil
+	return nil
 }
 
+/*
 func shard_callback(shard []byte, out_file string) error {
 
 	log.Debugf("inside callback is in: %s", out_file)
@@ -310,7 +358,6 @@ func shard_callback(shard []byte, out_file string) error {
 		os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
-
 	}
 	_, err = f.Write(shard)
 	if err != nil {
@@ -318,9 +365,25 @@ func shard_callback(shard []byte, out_file string) error {
 	}
 	f.Close()
 	return nil
+}*/
+
+func (enc *FECFileEncoder) handle_shards(chunk *Chunk, w io.Writer) error {
+	for j := 0; j < enc.total_shards; j++ {
+		b := chunk.shard_header
+		b[1] = byte(j) // fill shard_idx in shard header
+		_, err := w.Write(b[:])
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(chunk.shards[j])
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string,
+/*func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string,
 	callback func([]byte, string) error) error {
 
 	log.Debugf("OUTPUT is in: %s.%04d", out_base, 1)
@@ -371,14 +434,11 @@ func (enc *FECFileEncoder) send_chunks(chunks []Chunk, out_base string,
 	}
 	log.Debug("Finished send_chunks")
 	return nil
-}
+}*/
 
 func (enc *FECFileEncoder) encode(filename string, out_dir string) {
 
-	chunks, err := enc.get_chunks(filename, enc.max_chunk_size, int(enc.idGen.Generate()))
-	checkErr(err)
-
-	err = enc.send_chunks(chunks, filepath.Join(out_dir, filepath.Base(filename)), shard_callback)
+	err := enc.encode_chunks(filename, enc.max_chunk_size, filepath.Join(out_dir, filepath.Base(filename)))
 	checkErr(err)
 
 	log.Debug("Finished")
@@ -393,12 +453,19 @@ func (fs *FileStatus) free_file() {
 
 }
 
-func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
+func (dec *FECFileDecoder) put_shard(shard []byte) {
 	// read header from beginning
-	file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
-		shard_idx, num_data_shards, num_parity_shards := parse_shard_header(shard[:shard_header_size])
-	log.Debug("shard header is ", file_id, file_size, chunk_idx, total_chunks, chunk_data_size,
-		shard_idx, num_data_shards, num_parity_shards)
+	file_id, chunk_idx, total_chunks, chunk_size,
+		shard_idx, num_data_shards, num_parity_shards,
+		version, shard_data_size, zero_padding_length := parse_shard_header(shard[:shard_header_size])
+	log.Debug("shard header is ", file_id, chunk_idx, total_chunks, chunk_size,
+		shard_idx, num_data_shards, num_parity_shards,
+		version, shard_data_size, zero_padding_length)
+
+	if version != shard_header_version {
+		log.Warn("unknown header version")
+		return
+	}
 
 	// check if new file
 	if _, ok := dec.all_files[file_id]; !ok {
@@ -406,32 +473,32 @@ func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 		dec.all_files[file_id] = new(FileStatus)
 		this_file := dec.all_files[file_id]
 		this_file.chunks = make([]Chunk, total_chunks)
-
-		file_chunks := this_file.chunks
-		this_file.num_data_shards = num_data_shards
-		this_file.num_parity_shards = num_parity_shards
-		this_file.num_total_shards = num_data_shards + num_parity_shards
-		this_file.file_size = file_size
+		this_file.num_data_shards = int(num_data_shards)
+		this_file.num_parity_shards = int(num_parity_shards)
+		this_file.num_total_shards = int(num_data_shards + num_parity_shards)
 		this_file.file_id = file_id
 		this_file.total_chunks = int(total_chunks)
-		this_file.shard_data_size = len(shard) - shard_header_size
+		this_file.chunk_size = int(chunk_size)
+		this_file.zero_padding_length = int(zero_padding_length)
+		this_file.shard_data_size = int(shard_data_size)
+		this_file.output_folder = dec.output_folder
+		this_file.file_size = int64(total_chunks*chunk_size - zero_padding_length)
 
 		// initialize all chunks for this file
-		for j := 0; j < this_file.total_chunks; j++ {
+		for j := range this_file.chunks {
+			chunk := &this_file.chunks[j]
 			// chunk_buffer holds the actual data of the chunk (without headers)
-			// NOTE: chunk_buffer is padded with zeros, actual size is in chunk_data_size
-			file_chunks[j].chunk_buffer = make([]byte,
-				int(this_file.num_total_shards)*this_file.shard_data_size)
-			file_chunks[j].chunk_idx = j
-			file_chunks[j].shards = make([][]byte, int(this_file.num_total_shards))
-			// initialize all shards for this chunk
-			// each shard points to its slice in the chunk_buffer
-			for k := 0; k < int(this_file.num_total_shards); k++ {
-				// Default is slice with zero length
-				// This is important for reconstruction, see docs for "reedsolomon.Reconstruct"
-				idx_start := this_file.shard_data_size * k
-				file_chunks[j].shards[k] = file_chunks[j].chunk_buffer[idx_start:idx_start]
-			}
+			// NOTE: chunk_buffer is padded with zeros
+			// exact length of zero padding is in chunk.zero_padding_length
+			chunk.chunk_idx = j
+			chunk.chunk_size = this_file.chunk_size
+			chunk.zero_padding_length = this_file.zero_padding_length
+			chunk.file_id = this_file.file_id
+			chunk.file_size = this_file.file_size
+			chunk.num_data_shards = this_file.num_data_shards
+			chunk.num_parity_shards = this_file.num_parity_shards
+			chunk.total_chunks = this_file.total_chunks
+
 		}
 
 		// mark timestamp for file arrival start
@@ -455,11 +522,19 @@ func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 		log.Warn("shard arrived for already finished chunk")
 		return
 	}
-	if this_chunk.timestamp == 0 {
+	if this_chunk.timestamp == 0 { // newly arrived chunk
 		this_chunk.timestamp = time.Now().Unix()
-	}
-	if this_chunk.chunk_data_size == 0 {
-		this_chunk.chunk_data_size = int(chunk_data_size)
+		this_chunk.chunk_buffer = make([]byte,
+			int(this_file.num_total_shards)*this_file.shard_data_size)
+		this_chunk.shards = make([][]byte, int(this_file.num_total_shards))
+		// initialize all shards for this chunk
+		// each shard points to its slice in the chunk_buffer
+		for k := 0; k < int(this_file.num_total_shards); k++ {
+			// Default is slice with zero length
+			// This is important for reconstruction, see docs for "reedsolomon.Reconstruct"
+			idx_start := this_file.shard_data_size * k
+			this_chunk.shards[k] = this_chunk.chunk_buffer[idx_start:idx_start]
+		}
 	}
 	// if now is after timeout for chunk
 	if time.Now().Unix() > this_chunk.timestamp+dec.chunk_timeout {
@@ -470,8 +545,8 @@ func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 	}
 
 	// copy shard data to chunk_buffer
-	idx_start := int(shard_idx) * dec.all_files[file_id].shard_data_size
-	idx_end := idx_start + dec.all_files[file_id].shard_data_size
+	idx_start := int(shard_idx) * this_file.shard_data_size
+	idx_end := idx_start + this_file.shard_data_size
 	copy(this_chunk.chunk_buffer[idx_start:idx_end], shard[shard_header_size:])
 
 	// make shard slice point to where the data is in chunk_buffer
@@ -479,7 +554,7 @@ func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 
 	// keep track how many shards have arrived
 	this_chunk.arrived_shards++
-	if shard_idx < uint16(num_data_shards) {
+	if shard_idx < num_data_shards {
 		this_chunk.arrived_data_shards++
 	}
 
@@ -509,65 +584,101 @@ func (dec *FECFileDecoder) put_shard(shard []byte, output_folder string) {
 
 		}
 		log.Debugf("Finished file %d chunk %d, writing to output dir: %s",
-			file_id, chunk_idx, output_folder)
-		this_file.write_chunk(int(chunk_idx), output_folder)
+			file_id, chunk_idx, dec.output_folder)
+		this_file.write_chunk(int(chunk_idx))
 		this_chunk.is_finished = true
 	}
 
 }
 
-func (dec *FECFileDecoder) read_chunks(input_folder, output_folder string) {
+func (dec *FECFileDecoder) read_shards(r *bufio.Reader) error {
+	for {
+		ver, err := r.Peek(1)
+		if err != nil {
+			if err == io.EOF {
+				log.Debug("read_shards: reached EOF")
+				return nil
+			}
+			return err
+		}
+		if ver[0] != shard_header_version {
+			err = fmt.Errorf("unknown shard header version")
+			log.Error(err)
+			return err
+		}
+		header, err := r.Peek(shard_header_size)
+		if err != nil {
+			return err
+		}
+		shard_size := binary.LittleEndian.Uint32(header[4:])
+		shard_buf := make([]byte, shard_header_size+shard_size)
+		num_read, err := io.ReadFull(r, shard_buf)
+		if err != nil {
+			log.Errorf("read_shards : ReadFull - num read is %d / %d", num_read, shard_header_size+shard_size)
+			return err
+		}
+		log.Debug("read_shards: putting shard")
+		dec.put_shard(shard_buf)
+	}
+}
+
+func (dec *FECFileDecoder) decode_from_folder(input_folder string) error {
 	files, err := ioutil.ReadDir(input_folder)
-	checkErr(err)
+	if err != nil {
+		return err
+	}
 
 	for _, f := range files {
 
 		filename := filepath.Join(input_folder, f.Name())
 
 		log.Debug("Opening ", filename)
-		shard, err := ioutil.ReadFile(filename)
-		checkErr(err)
+		file, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
 
-		dec.put_shard(shard, output_folder)
+		// start buffered read
+		// first - sequentially reads chunks form file
+		// then - spawns goroutines and encodes chunks concurrently
+		buffered_reader := bufio.NewReader(file)
+		dec.read_shards(buffered_reader)
 	}
+	return nil
 }
 
-func (fs *FileStatus) write_chunk(chunk_idx int, out_dir string) error {
+func (fs *FileStatus) write_chunk(chunk_idx int) error {
 	outfile_basename := fmt.Sprintf("%d.out", fs.file_id)
-	outfile_fullname := filepath.Join(out_dir, outfile_basename)
+	outfile_fullname := filepath.Join(fs.output_folder, outfile_basename)
 	chunk := fs.chunks[chunk_idx]
-	offset := chunk_idx * chunk.chunk_data_size
-	if chunk_idx == fs.total_chunks-1 {
-		// special case
-		// if this is the last chunk, then chunk_data_size is remainder (file_size % max_chunk_size)
-		// this means the offset cannot be calculated as above (chunk_idx * chunk_data_size)
-		// luckily, for last chunk we can simply subtract chunk_data_size from total file size
-		// this works even if the file is divided perfectly to equal size chunks (no remainder)
-		offset = int(fs.file_size) - chunk.chunk_data_size
-	}
+	offset := chunk_idx * chunk.chunk_size
+
 	f, err := os.OpenFile(outfile_fullname, os.O_CREATE|os.O_WRONLY, 0644)
 	checkErr(err)
 	defer f.Close()
-	log.Debugf("chunk WriteAt: chunk idx: %d,chunk_data_size: %d, offset: %d, filesize %d",
-		chunk_idx, chunk.chunk_data_size, offset, fs.file_size)
-	bytes_written, err := f.WriteAt(chunk.chunk_buffer[:chunk.chunk_data_size], int64(offset))
+	log.Debugf("chunk WriteAt: file %s, chunk idx: %d,chunk_size: %d, offset: %d, filesize %d",
+		outfile_fullname, chunk_idx, chunk.chunk_size, offset, fs.file_size)
+	size_to_write := chunk.chunk_size
+	if chunk_idx == chunk.total_chunks-1 {
+		// last chunk has partial data
+		// for last chunk:  chunk_size = last_chunk_data + zero_padding
+		size_to_write = chunk.chunk_size - chunk.zero_padding_length
+	}
+
+	bytes_written, err := f.WriteAt(chunk.chunk_buffer[:size_to_write], int64(offset))
 	if err != nil {
 		log.Error("error writing file: ", err)
 		return err
 	}
-	if bytes_written != chunk.chunk_data_size {
+	if bytes_written != size_to_write {
 		err = fmt.Errorf("error writing file %d :  chunk %d wrote %d bytes (expected %d)",
-			fs.file_id, chunk_idx, bytes_written, chunk.chunk_data_size)
+			fs.file_id, chunk_idx, bytes_written, size_to_write)
 		log.Error(err)
 		return err
 	}
 	chunk.chunk_buffer = nil
 	return nil
-}
-
-func (dec *FECFileDecoder) decode(input_folder string, output_dir string) {
-	dec.all_files = make(map[uint64]*FileStatus)
-	dec.read_chunks(input_folder, output_dir)
 }
 
 func main() {
@@ -578,9 +689,9 @@ func main() {
 	log.Debug("before encode")
 	encoder.encode(*arg_input_file, *arg_enc_out_dir)
 
-	decoder := newFECFileDecoder(int64(*arg_chunk_timeout))
+	decoder := newFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
 	log.Debug("before decode")
-	decoder.decode(*arg_enc_out_dir, *arg_dec_out_dir)
+	decoder.decode_from_folder(*arg_enc_out_dir)
 	log.Debug("finish")
 }
 
