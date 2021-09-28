@@ -1,2 +1,2 @@
 # arson
-use klaus post reed solomon to make files ready for udp transfer
+Use Klaus Post's Reed Solomon package and utilize it for large files
