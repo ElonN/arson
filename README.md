@@ -2,5 +2,5 @@
 Use Klaus Post's Reed Solomon package and utilize it for large files
 
 
-# Links
+## Links
 https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
