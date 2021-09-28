@@ -426,31 +426,6 @@ func (enc *FECFileEncoder) EncodeStream(filename string, writer *bufio.Writer) e
 	return nil
 }
 
-/*
-func (enc *FECFileEncoder) handle_shards(chunk *Chunk, w io.Writer) error {
-	for j := 0; j < enc.num_total_shards; j++ {
-		b := chunk.shard_header
-		b[1] = byte(j) // fill shard_idx in shard header
-		_, err := w.Write(b[:])
-		if err != nil {
-			return err
-		}
-		_, err = w.Write(chunk.shards[j])
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (enc *FECFileEncoder) encode_to_files(filename string, out_dir string) {
-
-	err := enc.encode_chunks(filename, filepath.Join(out_dir, filepath.Base(filename)))
-	checkErr(err)
-
-	log.Debug("Finished")
-} */
-
 func (fs *FileStatus) free_file() {
 
 	for i := range fs.chunks {
@@ -667,7 +642,9 @@ func (fs *FileStatus) write_chunk(chunk_idx int) error {
 	offset := chunk_idx * chunk.chunk_size
 
 	f, err := os.OpenFile(outfile_fullname, os.O_CREATE|os.O_WRONLY, 0644)
-	checkErr(err)
+	if err != nil {
+		return err
+	}
 	defer f.Close()
 	log.Debugf("chunk WriteAt: file %s, chunk idx: %d,chunk_size: %d, offset: %d, filesize %d",
 		outfile_fullname, chunk_idx, chunk.chunk_size, offset, fs.file_size)
