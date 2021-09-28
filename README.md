@@ -3,7 +3,7 @@
 
 # arson
 A package for applying [Reed-Solomon error correction](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction) for reliable one-way data transfer.
-It uses [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilizes extra functionality essential for data transfer
+It uses [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilizes extra functionality essential for data transfer.
 
 From Klaus' documentation about shortcomings of his [simple encoder/decoder](https://github.com/klauspost/reedsolomon/tree/master/examples):
 
