@@ -3,7 +3,9 @@
 
 # arson
 A package for applying [Reed-Solomon error correction](https://en.wikipedia.org/wiki/Reed%E2%80%93Solomon_error_correction) for reliable one-way data transfer.
-It uses [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilizes extra functionality essential for data transfer.
+
+It uses [Klaus Post's Reed Solomon package](https://github.com/klauspost/reedsolomon) and utilizes extra functionality essential for data transfer. The code was
+inspired in a way by [xtaci's "kcp-go"](https://github.com/xtaci/kcp-go)'s implementation of "FEC Encoder/Decoder". 
 
 From Klaus' documentation about shortcomings of his [simple encoder/decoder](https://github.com/klauspost/reedsolomon/tree/master/examples):
 
@@ -49,3 +51,4 @@ decoder.Decode(input_stream)
 
 ## Links
 https://github.com/klauspost/reedsolomon -- Reed-Solomon Erasure Coding in Go
+https://github.com/xtaci/kcp-go -- kcp-go is a Production-Grade Reliable-UDP library for golang
