@@ -26,8 +26,14 @@ type FECFileEncoder struct {
 	chunks             []Chunk
 }
 
-// Returns a new File FEC Encoder. This
+// Returns a new File FEC Encoder.
+// The encoder receives the number of data shards and parity shards as in input, as well
+// as the maximum size of each shard.
+// The maximum shard size must be larger than 32 byte.
 func NewFECFileEncoder(data_shards, parity_shards, max_shard_size int) *FECFileEncoder {
+	if max_shard_size <= shard_header_size {
+		return nil
+	}
 	enc := new(FECFileEncoder)
 	enc.num_data_shards = data_shards
 	enc.num_parity_shards = parity_shards
@@ -36,7 +42,8 @@ func NewFECFileEncoder(data_shards, parity_shards, max_shard_size int) *FECFileE
 	enc.shard_data_size = max_shard_size - shard_header_size
 	enc.total_chunk_buffer = enc.num_total_shards * enc.shard_data_size
 	enc.max_chunk_size = enc.shard_data_size * int(enc.num_data_shards)
-	enc.idGen, _ = snowflake.NewNode(time.Now().Unix() % 255)
+	random_snowflake_node := time.Now().Unix() % (int64(math.Pow(2, float64(snowflake.NodeBits))))
+	enc.idGen, _ = snowflake.NewNode(random_snowflake_node)
 	return enc
 }
 
