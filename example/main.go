@@ -53,7 +53,7 @@ func example_encode_decode_to_stream() {
 
 	var writer io.Writer = write_stream
 
-	encoder.EncodeToStream(*arg_input_file, writer)
+	encoder.EncodeFileToStream(*arg_input_file, writer)
 
 	stream_to_decode, err := os.Open(*arg_enc_out_file)
 	if err != nil {
@@ -71,7 +71,7 @@ func example_encode_decode_to_folder() {
 	encoder := arson.NewFECFileEncoder(*arg_num_data_shards, *arg_num_parity_shards, *arg_full_shard_size)
 	decoder := arson.NewFECFileDecoder(int64(*arg_chunk_timeout), *arg_dec_out_dir)
 
-	encoder.EncodeToFolder(*arg_input_file, *arg_enc_out_dir)
+	encoder.EncodeFileToFolder(*arg_input_file, *arg_enc_out_dir)
 	decoder.DecodeFromFolder(*arg_enc_out_dir)
 }
 
