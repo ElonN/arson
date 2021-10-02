@@ -3,31 +3,40 @@ package arson
 import (
 	"io/ioutil"
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
-func BenchmarkFECDecode(b *testing.B) {
+func BenchmarkDecode(b *testing.B) {
 
-	files_path := filepath.Join(os.TempDir(), "fectest-469469927")
-	decoder := NewFECFileDecoder(60, files_path)
+	num_data := 10
+	num_parity := 3
+	mtu := 1300
+	encoder := NewFECFileEncoder(num_data, num_parity, mtu)
+
+	temp_dir, _ := ioutil.TempDir("", "fectest-*")
+	defer os.RemoveAll(temp_dir)
+
+	fname, fsize, fhash := create_random_input_file(temp_dir)
+	ioutil.WriteFile(fname+".hash", fhash, 0644)
+	f, _ := os.Open(fname)
+
+	encoded_fname := fname + ".encoded"
+	f_encoded, _ := os.OpenFile(encoded_fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+
+	_ = encoder.EncodeToStream(f, int64(fsize), f_encoded)
+	f.Close()
+	f_encoded.Close()
+
+	f_info, _ := os.Stat(encoded_fname)
+	b.SetBytes(f_info.Size())
+	decoder := NewFECFileDecoder(60, temp_dir)
 
 	b.ReportAllocs()
-	files, _ := ioutil.ReadDir(files_path)
-
-	var sum_sizes int64
-
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".encoded") {
-			filename := filepath.Join(files_path, f.Name())
-			file_to_decode, _ := os.Open(filename)
-			f_stat, _ := file_to_decode.Stat()
-			sum_sizes += f_stat.Size()
-			decoder.Decode(file_to_decode)
-			file_to_decode.Close()
-		}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		f_in, _ := os.Open(encoded_fname)
+		decoder.Decode(f_in)
+		f_in.Close()
 	}
-	b.SetBytes(sum_sizes)
-
+	b.StopTimer()
 }
