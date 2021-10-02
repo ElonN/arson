@@ -144,7 +144,6 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 
 	this_file := dec.all_files[file_id]
 	if this_file.is_finished {
-		log.Warn("shard arrived for already finished file")
 		return
 	}
 	if this_file.is_failed {
@@ -156,7 +155,6 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 	// that has arrived. first, let's fill in chunk data.
 	this_chunk := &this_file.chunks[chunk_idx]
 	if this_chunk.is_finished {
-		log.Warn("shard arrived for already finished chunk")
 		return
 	}
 	if this_chunk.timestamp == 0 { // newly arrived chunk
@@ -222,8 +220,19 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 		}
 		log.Debugf("Finished file %d chunk %d, writing to output dir: %s",
 			file_id, chunk_idx, dec.output_folder)
-		this_file.write_chunk(int(chunk_idx))
+		err = this_file.write_chunk(int(chunk_idx))
+		if err != nil {
+			log.Error("write_chunk ", chunk_idx, " failed: ", err)
+			return
+		}
 		this_chunk.is_finished = true
+		this_chunk.free()
+		this_file.arrived_chunks++
+		if this_file.arrived_chunks == this_file.total_chunks {
+			log.Infof("Finished file %d, writing to output dir: %s",
+				file_id, dec.output_folder)
+			this_file.is_finished = true
+		}
 	}
 
 }
@@ -321,6 +330,5 @@ func (fs *FileStatus) write_chunk(chunk_idx int) error {
 		log.Error(err)
 		return err
 	}
-	chunk.chunk_buffer = nil
 	return nil
 }
