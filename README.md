@@ -21,10 +21,14 @@ From Klaus' documentation about shortcomings of his [simple encoder/decoder](htt
 >  * If two shards have been swapped, reconstruction will always fail.
 >    You need to supply the shards in the same order as they were given to you.
 
-This package takes large files, splits it to chunks with adjustable size, and applys reed-solomon encoding for each chunk.
+This package takes large files, splits it to chunks with adjustable size, and applies reed-solomon encoding for each chunk.
 Additionally it adds a header to each shard tracking important info such as file id, sizes, chunk index and shard index.
 This header makes it possible to deduce all required information for reconstruction from the content of the shards only.
 That means user can ignore ordering, file names, etc. - just transfer enough shards to the decoder.
+
+The input data to encode can be of the following: 
+* Stream from io.Reader (number of bytes should be given as argument)
+* Read from file
 
 The shards can be emitted in the following ways:
 * Streamed to given io.writer
@@ -40,7 +44,12 @@ On sender side -
 
 encoder := arson.NewFECFileEncoder(num_data_shards, num_parity_shards, max_shard_size)
 var writer io.Writer = stream_to_output
-encoder.EncodeToStream(input_filepath, stream_to_output)
+
+// read from file
+encoder.EncodeFileToStream(input_filepath, stream_to_output)
+
+// read from stream (io.Reader)
+encoder.EncodeToStream(reader_input, number_of_bytes, stream_to_output)
 ``` 
 On receiver side -
 ```go
