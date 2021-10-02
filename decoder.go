@@ -220,7 +220,7 @@ func (dec *FECFileDecoder) put_shard(shard []byte) {
 		}
 		log.Debugf("Finished file %d chunk %d, writing to output dir: %s",
 			file_id, chunk_idx, dec.output_folder)
-		err = this_file.write_chunk(int(chunk_idx))
+		err := this_file.write_chunk(int(chunk_idx))
 		if err != nil {
 			log.Error("write_chunk ", chunk_idx, " failed: ", err)
 			return
