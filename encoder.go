@@ -174,6 +174,13 @@ func (enc *FECFileEncoder) encode_file_internal(filename string, output_dir stri
 	return enc.encode_internal(file, filesize, output_dir, writer)
 }
 
+// This function will read sequentially from io.reader and fill chunk data.
+// After a whole chunk is filled, it will fire up a goroutine that computes the
+// reed-solomon encoding concurrently.
+// The main function will continue reading chunks and starting goroutines.
+// Meanwhile, the output goroutine is running in the backgroung waiting for the
+// encoding goroutines to send ready buffers to output to the writer.
+// The signals and datav are sent through channels.
 func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_dir string, writer io.Writer) error {
 	file_id := uint64(enc.idGen.Generate())
 
@@ -223,6 +230,12 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 	log.Debug("Starting chunk goroutines")
 	for i := 0; i < total_chunks; i++ {
 		this_chunk := &chunks[i]
+
+		//  read data and fill into shards in chunk buffer
+		//  after filled out, chunk_buffer will look as following:
+		//  some of the data shards will be fully occupied with real data, and if zero padding is needed
+		//  in order to fill exactly num_data_shards * shard_size, there will be at least one data
+		//  shard with data + padding, and possibly some data shards filled only by zero padding
 
 		//				 |------DATA SHARDS-----------| |----PARITY SHARDS-----|
 		// chunk_buffer = data_from_file + zero_padding + space_for_parity_shards
@@ -307,7 +320,7 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 	// now wait for writer goroutine to finish
 	select {
 	case <-write_done_channel: // write goroutine finished
-		log.Debug("got finish signal from writing routine")
+		log.Info("finished writing file ", file_id)
 		break
 	case err := <-fatal_errors:
 		log.Debug("got fatal error from channel")
