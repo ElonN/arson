@@ -193,43 +193,47 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 	total_chunks := enc.total_chunks
 	log.Debug("num_chunks is ", total_chunks)
 
+	// make channels to communicate with io writer goroutine
+	fatal_errors := make(chan error)
+	chunk_channel := make(chan *Chunk)
+	write_done_channel := make(chan bool)
+
+	// writer is nil when caller wants all shards in memory
+	if writer != nil {
+		// spawn io worker goroutine
+		go enc.send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
+	}
+
 	// chunks are saved in the encoder context
 	enc.chunks = make([]Chunk, total_chunks)
 	chunks := enc.chunks
 
-	// each chunk should be rather independent from encoder context, so we will
-	// initialize all relevent data to chunk attributes
-	for i := 0; i < total_chunks; i++ {
-		chunks[i].chunk_size = chunk_size
-		chunks[i].chunk_idx = i
-		chunks[i].file_id = file_id
-		chunks[i].total_chunks = total_chunks
-		chunks[i].file_size = num_bytes
-		chunks[i].chunk_buffer = make([]byte, enc.num_total_shards*enc.shard_data_size)
-		chunks[i].num_data_shards = enc.num_data_shards
-		chunks[i].num_parity_shards = enc.num_parity_shards
-		chunks[i].num_total_shards = enc.num_total_shards
-		chunks[i].shard_data_size = enc.shard_data_size
-		chunks[i].zero_padding_length = total_chunks*chunk_size - int(num_bytes)
-
-		err := chunks[i].fill_shard_header()
-		if err != nil {
-			return err
-		}
-	}
-
-	// make channels to communicate workers
-	fatal_errors := make(chan error)
-	chunk_channel := make(chan *Chunk)
-	write_done_channel := make(chan bool)
+	// we are going to spawn <total_chunks> goroutines that encode chunks
+	// to wait for all of them to finish, we create a wait group
 	wg_done := make(chan bool)
-
 	var wg sync.WaitGroup
 	wg.Add(total_chunks)
 
-	log.Debug("Starting chunk goroutines")
+	// each chunk should be rather independent from encoder context, so we will
+	// initialize all relevent data to chunk attributes
 	for i := 0; i < total_chunks; i++ {
-		this_chunk := &chunks[i]
+		chunk := &chunks[i]
+		chunk.chunk_size = chunk_size
+		chunk.chunk_idx = i
+		chunk.file_id = file_id
+		chunk.total_chunks = total_chunks
+		chunk.file_size = num_bytes
+		chunk.chunk_buffer = make([]byte, enc.num_total_shards*enc.shard_data_size)
+		chunk.num_data_shards = enc.num_data_shards
+		chunk.num_parity_shards = enc.num_parity_shards
+		chunk.num_total_shards = enc.num_total_shards
+		chunk.shard_data_size = enc.shard_data_size
+		chunk.zero_padding_length = total_chunks*chunk_size - int(num_bytes)
+
+		err := chunk.fill_shard_header()
+		if err != nil {
+			return err
+		}
 
 		//  read data and fill into shards in chunk buffer
 		//  after filled out, chunk_buffer will look as following:
@@ -240,31 +244,30 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 		//				 |------DATA SHARDS-----------| |----PARITY SHARDS-----|
 		// chunk_buffer = data_from_file + zero_padding + space_for_parity_shards
 
-		size_to_read := this_chunk.chunk_size
+		size_to_read := chunk.chunk_size
 		if i == total_chunks-1 {
 			// last chunk has partial data
 			// for last chunk:  chunk_size = last_chunk_data + zero_padding
 			// hence size to read is the following -
-			size_to_read = this_chunk.chunk_size - this_chunk.zero_padding_length
+			size_to_read = chunk.chunk_size - chunk.zero_padding_length
 		}
-		bytes_read, err := io.ReadFull(r, this_chunk.chunk_buffer[:size_to_read])
+		bytes_read, err := io.ReadFull(r, chunk.chunk_buffer[:size_to_read])
 		if err != nil {
 			return err
 		}
 		log.Debug("Read ", bytes_read, " / ", size_to_read, " bytes for chunk ", i)
 
-		// Each of these go routines will encode a chunk and create the parity shards
-		go func(chunk *Chunk) {
-			defer wg.Done()
-			log.Debug("Inside chunk goroutine number ", chunk.chunk_idx)
+		// "shards" are just slices from chunk_buffer
+		chunk.shards = make([][]byte, enc.num_total_shards)
+		for j := 0; j < enc.num_total_shards; j++ {
+			idx_start := enc.shard_data_size * j
+			idx_end := idx_start + enc.shard_data_size
+			chunk.shards[j] = chunk.chunk_buffer[idx_start:idx_end]
+		}
 
-			// "shards" are just slices from chunk_buffer
-			chunk.shards = make([][]byte, enc.num_total_shards)
-			for j := 0; j < enc.num_total_shards; j++ {
-				idx_start := enc.shard_data_size * j
-				idx_end := idx_start + enc.shard_data_size
-				chunk.shards[j] = chunk.chunk_buffer[idx_start:idx_end]
-			}
+		// Each of these go routines will encode a chunk and create the parity shards
+		go func(c *Chunk) {
+			defer wg.Done()
 
 			// create encoding matrix
 			encoder, err := reedsolomon.New(enc.num_data_shards, enc.num_parity_shards)
@@ -272,24 +275,19 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 				fatal_errors <- err
 			}
 			// perform the encode - create parity shards
-			err = encoder.Encode(chunk.shards)
+			err = encoder.Encode(c.shards)
 			if err != nil {
 				fatal_errors <- err
 			}
 			// writer is nil when caller wants all shards in memory and not to use streaming
 			if writer != nil {
 				// send chunk to io worker goroutine
-				chunk_channel <- chunk
+				chunk_channel <- c
 			} else if output_dir != "" {
-				chunk.write_shards_to_folder(output_dir)
+				c.write_shards_to_folder(output_dir)
 			} // else: shards will remain in memory
 
-		}(this_chunk)
-	}
-	// writer is nil when caller wants all shards in memory
-	if writer != nil {
-		// spawn io worker goroutine
-		go enc.send_chunks_to_io(writer, chunk_channel, write_done_channel, fatal_errors)
+		}(chunk)
 	}
 
 	// final goroutine to wait until WaitGroup is done
@@ -312,7 +310,7 @@ func (enc *FECFileEncoder) encode_internal(r io.Reader, num_bytes int64, output_
 		close(chunk_channel)
 		break
 	case err := <-fatal_errors:
-		log.Debug("got fatal error from channel")
+		log.Error("got fatal error from channel")
 		wg.Wait()
 		return err
 	}
