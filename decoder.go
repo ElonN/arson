@@ -28,6 +28,7 @@ type FileStatus struct {
 	is_failed           bool
 	timestamp           int64
 	output_folder       string
+	arrived_chunks      int
 	chunks              []Chunk
 }
 
