@@ -65,7 +65,7 @@ func (enc *FECFileEncoder) send_chunks_to_io(writer io.Writer, cin chan *Chunk,
 }
 
 func (enc *FECFileEncoder) get_all_shards() [][]byte {
-	all_shards := make([][]byte, 0)
+	all_shards := make([][]byte, enc.num_total_shards*enc.total_chunks)
 	for i := range enc.chunks {
 		start_idx := i * enc.num_total_shards
 		end_idx := (i + 1) * enc.num_total_shards
