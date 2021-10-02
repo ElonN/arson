@@ -1,6 +1,7 @@
 package arson
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"math"
@@ -50,14 +51,16 @@ func NewFECFileEncoder(data_shards, parity_shards, max_shard_size int) *FECFileE
 func (enc *FECFileEncoder) send_chunks_to_io(writer io.Writer, cin chan *Chunk,
 	done chan bool, fatal_errors chan error) {
 	log.Debug("Starting to send chunks - listening on channel")
+	buf_writer := bufio.NewWriterSize(writer, enc.full_shard_size)
 	for chunk := range cin {
 		log.Debugf("send_chunks_to_io received chunk %d from channel", chunk.chunk_idx)
 		for j := 0; j < chunk.num_total_shards; j++ {
-			err := chunk.write_shard(j, writer)
+			err := chunk.write_shard(j, buf_writer)
 			if err != nil {
 				fatal_errors <- err
 			}
 		}
+		buf_writer.Flush()
 		chunk.free()
 	}
 	log.Debug("Finished sending chunks - channel closed")
